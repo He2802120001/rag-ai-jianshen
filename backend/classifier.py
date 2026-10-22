@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import re
+
 from openai import OpenAI
 
 from backend.config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL
@@ -17,6 +19,25 @@ _REFUSE_KEYWORDS = (
     "疼", "痛", "伤", "扭", "骨折", "发炎", "肿", "药", "手术", "术后",
     "病", "糖尿", "肾病", "肝病", "心脏", "血压", "孕", "怀孕", "康复",
     "治疗", "诊断", "腰椎间盘突出", "肩袖", "损伤", "痛风", "就医",
+)
+
+# 预防/避免语义：如"避免腰痛""预防肩伤"——是预防性问题，非伤病诊断求助。
+# 命中此模式的句子不归 refuse，即便其宾语含"痛/伤/疼"等伤病词。
+_PREVENTION_PATTERN = re.compile(r"(避免|预防|防止|减少|降低|避免出现).{0,10}(痛|伤|疼|损伤|肩袖|腰|膝|关节)")
+
+# 治疗/决策求助语义：这类是真正的伤病/医疗求助，即使句子含技术动作词也归 refuse，
+# 且优先于"技术咨询"与"预防"判定。
+_HELP_SEEK_KEYWORDS = (
+    "怎么治", "怎么治疗", "吃什么药", "用什么药", "该不该", "要不要手术", "需要手术",
+    "严重吗", "怎么办", "会不会", "能不能做", "能不能练", "能不能继续",
+)
+
+# 技术咨询语义：这类即便含伤病词（疼/痛/伤），本质是问动作技术/要领/原因/纠正，
+# 不归 refuse，而按领域分类到 technique 或 injury-prevention。
+_TECH_CONSULT_KEYWORDS = (
+    "原因", "为什么", "怎么调整", "怎么改", "如何调整", "如何避免", "如何预防",
+    "怎么避免", "怎么预防", "怎么纠正", "如何纠正", "动作要领", "是不是动作",
+    "是不是姿势", "是不是.*问题", "怎么练才对",
 )
 
 # 模糊 / 信息不足 → clarify
@@ -82,10 +103,23 @@ def classify(question: str) -> str:
     if len(q) < _MIN_QUESTION_LEN:
         return "clarify"
 
-    # 2) refuse 关键词（安全边界，优先）
-    for kw in _REFUSE_KEYWORDS:
-        if kw in q:
-            return "refuse"
+    # 1.5) 意图分层：先判断"求助/技术咨询/预防"语义，再决定是否走 refuse
+    help_seek = any(kw in q for kw in _HELP_SEEK_KEYWORDS) or bool(
+        re.search(r"(还能|能不能|能不能够|能做|能练).{0,4}(深蹲|硬拉|卧推|划船|肩推|继续|做|练|吗)", q)
+    )
+    tech_consult = any(kw in q for kw in _TECH_CONSULT_KEYWORDS)
+    is_prevention = bool(_PREVENTION_PATTERN.search(q))
+
+    # 2) 真正的治疗/决策求助 → refuse（不落入技术咨询或预防判定）
+    if help_seek:
+        return "refuse"
+
+    # 3) 预防/技术咨询语义：不视为伤病诊断求助，跳过 refuse 关键词
+    if not (is_prevention or tech_consult):
+        # 4) refuse 关键词（安全边界）
+        for kw in _REFUSE_KEYWORDS:
+            if kw in q:
+                return "refuse"
 
     # 3) 明确的泛问 → clarify
     for kw in _CLARIFY_KEYWORDS:
