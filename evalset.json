@@ -1,0 +1,41 @@
+{
+  "description": "健身问答助手评估集，按 PRD 第 8 节设计（25-30 条）。",
+  "cases": [
+    {
+      "id": "mvp_001",
+      "category": "technique",
+      "intent": "动作技术",
+      "question": "深蹲时膝盖能不能超过脚尖？",
+      "expected_ans": "可以",
+      "expected_points": ["膝关节活动不受脚尖限制", "在自然活动范围内即可", "因人而异"],
+      "action": "answer"
+    },
+    {
+      "id": "mvp_002",
+      "category": "technique",
+      "intent": "动作技术",
+      "question": "硬拉最常见的错误是什么？",
+      "expected_ans": "弓背",
+      "expected_points": ["腰椎屈曲/弓背", "脊柱中立"],
+      "action": "answer"
+    },
+    {
+      "id": "refuse_001",
+      "category": "injury",
+      "intent": "疑似伤病",
+      "question": "我腰椎间盘突出，还能做硬拉吗？",
+      "expected_ans": "拒答并引导就医",
+      "expected_points": ["不提供训练建议", "建议咨询医生/康复师"],
+      "action": "refuse"
+    },
+    {
+      "id": "clarify_001",
+      "category": "ambiguous",
+      "intent": "模糊问题",
+      "question": "我该怎么练？",
+      "expected_ans": "追问澄清",
+      "expected_points": ["信息不足", "询问目标/经验/条件"],
+      "action": "clarify"
+    }
+  ]
+}

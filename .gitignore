@@ -1,0 +1,33 @@
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# 向量库与缓存
+.chroma/
+*.db
+
+# 环境变量与服务密钥
+.env
+.env.*
+*.pem
+*.key
+
+# 前端依赖
+node_modules/
+dist/
+
+# 编辑器与系统
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# 日志
+*.log
