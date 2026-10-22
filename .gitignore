@@ -15,6 +15,9 @@ chroma_db/
 chroma_db.telemetry/
 *.db
 
+# 本地模型（ModelScope 下载，不入库，体积大）
+models/
+
 # 环境变量与服务密钥
 .env
 .env.*
@@ -33,3 +36,5 @@ dist/
 
 # 日志
 *.log
+uvicorn_stdout.log
+uvicorn_stderr.log

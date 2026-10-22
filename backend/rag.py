@@ -1,0 +1,253 @@
+"""核心 RAG 链路：文档加载、分块、建库、检索、生成回答。
+
+只实现单一 RAG 链路，不做意图分类 / 安全拒答 / 追问 / 前端 / 评估。
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import chromadb
+from openai import OpenAI
+from sentence_transformers import SentenceTransformer
+
+from backend.classifier import classify
+from backend.config import (
+    CHROMA_DIR,
+    CHUNK_OVERLAP,
+    CHUNK_SIZE,
+    COLLECTION_NAME,
+    DEEPSEEK_API_KEY,
+    DEEPSEEK_BASE_URL,
+    DEEPSEEK_MODEL,
+    DOCS_DIR,
+    DOC_CATEGORIES,
+    EMBEDDING_MODEL_NAME,
+    TOP_K,
+)
+
+# 检索相似度阈值：低于该相似度视为信息不足，追问而非硬答
+# ChromaDB cosine 距离(d) ∈ [0,2]，相似度取 1-d；阈值 0.5 对应 d <= 0.5
+SIMILARITY_THRESHOLD = 0.5
+
+# refuse / clarify 固定话术
+REFUSE_REPLY = "这个问题涉及伤病诊断或医疗建议，建议咨询医生或康复师。"
+CLARIFY_REPLY = "你想了解具体哪个动作、哪方面的训练，还是营养安排？请补充更多信息。"
+
+_MD_MARKERS = ("# ", "## ", "### ", "> ")
+
+
+def _chunk_text(text: str) -> list[str]:
+    """按段落贪心分块：段落到界后每块不超过 chunk_size，块间重叠 chunk_overlap 字。"""
+    if not text:
+        return []
+    chunks: list[str] = []
+    current = ""
+    # 以空行切分段落，合并成可读性好的连续块
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    for para in paragraphs:
+        # 若单段就超过块上限，按字符硬切（保留重叠）
+        if len(para) > CHUNK_SIZE:
+            # 先落盘当前缓冲
+            if current:
+                chunks.append(current)
+                current = ""
+            i = 0
+            while i < len(para):
+                chunks.append(para[i : i + CHUNK_SIZE])
+                i += CHUNK_SIZE - CHUNK_OVERLAP
+            continue
+        if current and len(current) + len(para) + 1 > CHUNK_SIZE:
+            chunks.append(current)
+            # 重叠：取当前块尾部 chunk_overlap 字作为下一块开头
+            current = current[-CHUNK_OVERLAP:] if len(current) >= CHUNK_OVERLAP else ""
+        current = (current + "\n\n" + para) if current else para
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def load_documents(docs_dir: Path = DOCS_DIR) -> list[dict]:
+    """遍历 docs 下各分类目录，读取 .md 文件并按段分块。
+
+    返回 list[dict]：每块含 text / source（相对项目根路径）/ category（目录名）。
+    """
+    docs: list[dict] = []
+    for category in DOC_CATEGORIES:
+        category_dir = docs_dir / category
+        if not category_dir.is_dir():
+            continue
+        for md_path in sorted(category_dir.glob("*.md")):
+            content = md_path.read_text(encoding="utf-8")
+            for idx, chunk in enumerate(_chunk_text(content)):
+                # 跳过只有标题标记的噪声块
+                stripped = chunk.strip()
+                if not stripped or stripped in _MD_MARKERS:
+                    continue
+                docs.append(
+                    {
+                        "text": stripped,
+                        "source": str(md_path.relative_to(docs_dir.parent)),
+                        "id": f"{category}:{md_path.stem}:{idx}",
+                        "category": category,
+                    }
+                )
+    return docs
+
+
+def _get_embedder() -> SentenceTransformer:
+    """模块级缓存 embedding 模型，避免多次加载。"""
+    if not hasattr(_get_embedder, "_model"):
+        _get_embedder._model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    return _get_embedder._model
+
+
+def _embed(texts: list[str]) -> list[list[float]]:
+    # bge 系模型建议 normalize；collection 用 cosine 距离，二者配合最佳
+    emb = _get_embedder().encode(texts, normalize_embeddings=True)
+    return emb.tolist()
+
+
+def _get_collection():
+    client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+    return client.get_or_create_collection(
+        name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
+    )
+
+
+def build_index() -> dict:
+    """加载文档、向量化并写入 ChromaDB。幂等：先删 collection 再重建。"""
+    docs = load_documents()
+    client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+    # 先删后建，保证重复调用不产生重复向量
+    try:
+        client.delete_collection(COLLECTION_NAME)
+    except Exception:
+        pass
+    collection = client.create_collection(
+        name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
+    )
+    if not docs:
+        return {"added": 0, "chunks": 0, "categories": {}}
+    texts = [d["text"] for d in docs]
+    ids = [d["id"] for d in docs]
+    metadatas = [{"source": d["source"], "category": d["category"]} for d in docs]
+    embeddings = _embed(texts)
+    collection.add(ids=ids, embeddings=embeddings, documents=texts, metadatas=metadatas)
+    cat_count: dict[str, int] = {}
+    for d in docs:
+        cat_count[d["category"]] = cat_count.get(d["category"], 0) + 1
+    return {"added": len(ids), "chunks": len(texts), "categories": cat_count}
+
+
+def retrieve(query: str, top_k: int = TOP_K, categories: list[str] | None = None) -> list[dict]:
+    """编码 query，从 ChromaDB 检索 top_k 片段。
+
+    返回 [{text, source, category, distance, similarity}]。
+    categories：若给定，则按类别过滤检索目录（如仅检索 technique）。
+    """
+    if not query.strip():
+        return []
+    collection = _get_collection()
+    q_emb = _embed([query.strip()])[0]
+    where = None
+    if categories:
+        # ChromaDB where 过滤：category 属于给定集合
+        where = {"category": {"$in": list(categories)}}
+    result = collection.query(
+        query_embeddings=[q_emb],
+        n_results=top_k,
+        where=where,
+        include=["documents", "metadatas", "distances"],
+    )
+    hits: list[dict] = []
+    docs = result["documents"][0]
+    metas = result["metadatas"][0]
+    dists = result["distances"][0]
+    for text, meta, dist in zip(docs, metas, dists):
+        d = float(dist)
+        hits.append(
+            {
+                "text": text,
+                "source": meta.get("source", ""),
+                "category": meta.get("category", ""),
+                "distance": d,
+                "similarity": 1.0 - d,
+            }
+        )
+    return hits
+
+
+def _build_prompt(query: str, context: list[dict]) -> str:
+    lines = ["你是一个健身知识问答助手，请仅依据下面的知识片段回答用户问题。", ""]
+    lines.append("可参考的知识片段：")
+    for i, hit in enumerate(context, 1):
+        lines.append(f"[片段{i}｜来源：{hit['source']}] {hit['text']}")
+    lines.append("")
+    lines.append("要求：")
+    lines.append("- 只依据片段作答，片段中没有的信息不要编造；")
+    lines.append("- 回答保持简洁，如相关可说明依据来源。")
+    lines.append("")
+    lines.append(f"用户问题：{query}")
+    return "\n".join(lines)
+
+
+def answer(query: str, top_k: int = TOP_K) -> dict:
+    """RAG 问答入口：先分类，再按类别决定 refuse / clarify / 正常检索生成。
+
+    返回 {"answer", "sources", "category", "refused", "clarify"}。
+    - refused=True：拒绝回答（伤病/医疗，固定话术，不检索）
+    - clarify=True：追问澄清（信息不足，不检索）
+    - 正常：按 category 限定检索目录，相似度不足时追问而非硬答
+    """
+    category = classify(query)
+
+    # 1) 应拒答类：不检索、不生成建议
+    if category == "refuse":
+        return {
+            "answer": REFUSE_REPLY,
+            "sources": [],
+            "category": category,
+            "refused": True,
+            "clarify": False,
+        }
+
+    # 2) 模糊问题：追问澄清
+    if category == "clarify":
+        return {
+            "answer": CLARIFY_REPLY,
+            "sources": [],
+            "category": category,
+            "refused": False,
+            "clarify": True,
+        }
+
+    # 3) 正常类：按类别目录限定检索（单目录；跨类检索留待后续）
+    categories = [category] if category in ("technique", "nutrition", "injury-prevention") else None
+    hits = retrieve(query, top_k=top_k, categories=categories)
+
+    # 相似度不足 → 追问而非硬答
+    if not hits or hits[0]["similarity"] < SIMILARITY_THRESHOLD:
+        return {
+            "answer": CLARIFY_REPLY,
+            "sources": [],
+            "category": category,
+            "refused": False,
+            "clarify": True,
+        }
+
+    prompt = _build_prompt(query, hits)
+    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+    resp = client.chat.completions.create(
+        model=DEEPSEEK_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3,
+    )
+    answer_text = resp.choices[0].message.content or ""
+    return {
+        "answer": answer_text,
+        "sources": [{"text": h["text"], "source": h["source"]} for h in hits],
+        "category": category,
+        "refused": False,
+        "clarify": False,
+    }
