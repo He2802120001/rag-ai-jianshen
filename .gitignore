@@ -11,6 +11,8 @@ __pycache__/
 
 # 向量库与缓存
 .chroma/
+chroma_db/
+chroma_db.telemetry/
 *.db
 
 # 环境变量与服务密钥
