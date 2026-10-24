@@ -122,16 +122,15 @@
     // 按文档名去重，避免同一来源重复出现
     const seen = new Set();
     sources.forEach((s) => {
-      // 去掉 .md 后缀仅剩文档名
+      // 去掉 .md 后缀，渲染为带书名号的中文资料名
       const name = fileName(s.source).replace(/\.md$/i, "");
       if (!name || seen.has(name)) return;
       seen.add(name);
       const tag = document.createElement("span");
       tag.className = "src-tag";
-      tag.textContent = name; // 📄 图标由 CSS ::before 追加
-      // title = source 的原文内容（取前 100 字），悬停可看参考了什么
-      const raw = (s.text || "").trim();
-      tag.title = raw ? (raw.length > 100 ? raw.slice(0, 100) + "…" : raw) : s.source || "";
+      tag.textContent = "《" + name + "》";
+      // 悬停提示：参考来源：《xxx》
+      tag.title = "参考来源：《" + name + "》";
       src.appendChild(tag);
     });
     bubble.appendChild(src);
@@ -219,6 +218,7 @@
         chat.appendChild(m.wrap);
         cursor = document.createElement("span");
         cursor.className = "type-cursor";
+        cursor.textContent = "▌"; // 流式期间的闪烁光标字符
         scrollToBottom();
         return;
       }
@@ -345,6 +345,193 @@
     const btn = e.target.closest(".quick-item");
     if (!btn || busy) return;
     ask(btn.dataset.q);
+  });
+
+  // ---------- 知识库管理后台（Admin）----------
+  const adminModal = document.getElementById("adminModal");
+  const adminLoginView = document.getElementById("adminLogin");
+  const adminPanelView = document.getElementById("adminPanel");
+  const adminTokenInput = document.getElementById("adminToken");
+  const adminLoginBtn = document.getElementById("adminLoginBtn");
+  const adminLoginError = document.getElementById("adminLoginError");
+  const adminOpenBtn = document.getElementById("adminOpen");
+  const adminCloseBtn = document.getElementById("adminClose");
+  const dropZone = document.getElementById("dropZone");
+  const fileInput = document.getElementById("fileInput");
+  const docList = document.getElementById("docList");
+  const docCount = document.getElementById("docCount");
+  const toastEl = document.getElementById("toast");
+
+  let adminToken = ""; // 会话内保存，刷新即清空
+  let toastTimer = null;
+
+  function showToast(msg, ok) {
+    toastEl.textContent = msg;
+    toastEl.classList.toggle("is-error", !ok);
+    toastEl.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => {
+      toastEl.hidden = true;
+    }, 2800);
+  }
+
+  function renderDocList(docs) {
+    docCount.textContent = docs.length;
+    docList.innerHTML = "";
+    docs.forEach((d) => {
+      const li = document.createElement("li");
+      li.className = "doc-item";
+      const name = fileName(d).replace(/\.md$/i, "");
+      const isUpload = String(d).replace(/\\/g, "/").includes("/uploads/");
+
+      const icon = document.createElement("span");
+      icon.className = "doc-icon";
+      icon.innerHTML =
+        '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>';
+
+      const text = document.createElement("span");
+      text.className = "doc-name";
+      text.textContent = "《" + name + "》";
+
+      const badge = document.createElement("span");
+      badge.className = "doc-badge" + (isUpload ? " doc-badge-upload" : "");
+      badge.textContent = isUpload ? "上传" : "内置";
+
+      li.appendChild(icon);
+      li.appendChild(text);
+      li.appendChild(badge);
+      docList.appendChild(li);
+    });
+  }
+
+  async function refreshDocs() {
+    try {
+      const resp = await fetch("/documents", { headers: { "X-Admin-Token": adminToken } });
+      if (!resp.ok) throw new Error();
+      const data = await resp.json();
+      renderDocList(data.documents || []);
+    } catch (e) {
+      showToast("文档列表加载失败", false);
+    }
+  }
+
+  function openAdmin() {
+    adminModal.hidden = false;
+    document.body.classList.add("modal-open");
+    if (adminToken) {
+      // 会话内已验证：直接进管理界面
+      adminLoginView.hidden = true;
+      adminPanelView.hidden = false;
+      refreshDocs();
+    } else {
+      adminLoginView.hidden = false;
+      adminPanelView.hidden = true;
+      adminLoginError.hidden = true;
+      setTimeout(() => adminTokenInput.focus(), 60);
+    }
+  }
+
+  function closeAdmin() {
+    adminModal.hidden = true;
+    document.body.classList.remove("modal-open");
+  }
+
+  // 登录 = 用 token 调 GET /documents：403 即密码错误，200 即通过并顺带拿到列表
+  async function tryLogin() {
+    const token = adminTokenInput.value.trim();
+    if (!token) return;
+    adminLoginBtn.disabled = true;
+    try {
+      const resp = await fetch("/documents", { headers: { "X-Admin-Token": token } });
+      if (resp.status === 403) {
+        adminLoginError.hidden = false;
+        return;
+      }
+      if (!resp.ok) throw new Error();
+      adminToken = token;
+      const data = await resp.json();
+      adminLoginView.hidden = true;
+      adminPanelView.hidden = false;
+      renderDocList(data.documents || []);
+    } catch (e) {
+      adminLoginError.hidden = false;
+    } finally {
+      adminLoginBtn.disabled = false;
+    }
+  }
+
+  async function uploadFile(file) {
+    if (!file) return;
+    const lower = file.name.toLowerCase();
+    if (!lower.endsWith(".md") && !lower.endsWith(".txt")) {
+      showToast("仅支持 .md / .txt 文件", false);
+      return;
+    }
+    let content;
+    try {
+      content = await file.text();
+    } catch (e) {
+      showToast("文件读取失败", false);
+      return;
+    }
+    try {
+      const resp = await fetch("/upload", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Admin-Token": adminToken },
+        body: JSON.stringify({ filename: file.name, content }),
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (resp.ok) {
+        showToast("✅ 《" + file.name.replace(/\.md$/i, "") + "》入库成功（" + data.added + " 块）", true);
+        refreshDocs();
+      } else {
+        showToast("❌ " + (data.detail || "上传失败"), false);
+      }
+    } catch (e) {
+      showToast("上传失败：网络异常", false);
+    }
+  }
+
+  adminOpenBtn.addEventListener("click", openAdmin);
+  adminCloseBtn.addEventListener("click", closeAdmin);
+  adminModal.addEventListener("click", (e) => {
+    if (e.target === adminModal) closeAdmin();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !adminModal.hidden) closeAdmin();
+  });
+  adminLoginBtn.addEventListener("click", tryLogin);
+  adminTokenInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") tryLogin();
+  });
+
+  // 上传区：点击选择 / 拖拽
+  dropZone.addEventListener("click", () => fileInput.click());
+  dropZone.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      fileInput.click();
+    }
+  });
+  fileInput.addEventListener("change", () => {
+    uploadFile(fileInput.files[0]);
+    fileInput.value = "";
+  });
+  ["dragenter", "dragover"].forEach((ev) =>
+    dropZone.addEventListener(ev, (e) => {
+      e.preventDefault();
+      dropZone.classList.add("is-drag");
+    })
+  );
+  ["dragleave", "drop"].forEach((ev) =>
+    dropZone.addEventListener(ev, (e) => {
+      e.preventDefault();
+      dropZone.classList.remove("is-drag");
+    })
+  );
+  dropZone.addEventListener("drop", (e) => {
+    const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    uploadFile(file);
   });
 
   // ---------- 初始化 ----------

@@ -3,21 +3,43 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import List, Optional
 
-from pathlib import Path
-
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from backend import rag
+from backend.config import ADMIN_TOKEN, DOCS_DIR, UPLOADS_DIR_NAME
 
 # 挂到 uvicorn 的日志配置上，输出会进入 uvicorn_stderr.log
 logger = logging.getLogger("uvicorn.error")
 
 app = FastAPI(title="Fitness QA Agent")
+
+# 动态上传文档的落盘目录与限制
+UPLOADS_DIR = DOCS_DIR / UPLOADS_DIR_NAME
+ALLOWED_EXTENSIONS = (".md", ".txt")
+MAX_UPLOAD_CHARS = 200_000  # 约 200KB 文本上限，防止超大文件拖垮服务
+
+# 伪科学/违规推广类敏感词：命中即拒绝入库（数据投毒防护的第一道闸）
+SENSITIVE_WORDS = (
+    "包治百病", "停药", "绝对安全", "根治", "包治", "神药",
+    "百分百有效", "无副作用", "三天见效", "抗癌", "保健品治疗",
+)
+
+
+class UploadRequest(BaseModel):
+    filename: str
+    content: str
+
+
+def _check_admin_token(x_admin_token: Optional[str]) -> None:
+    """管理接口鉴权：请求头 X-Admin-Token 必须与配置一致。"""
+    if x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="无权限：Admin Token 缺失或不正确")
 
 
 class AskRequest(BaseModel):
@@ -88,6 +110,44 @@ def ask_stream(req: AskRequest) -> StreamingResponse:
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache"},
     )
+
+
+@app.post("/upload")
+def upload(
+    req: UploadRequest, x_admin_token: Optional[str] = Header(default=None)
+) -> dict:
+    """动态知识库：上传新文档（JSON：filename + content），鉴权 + 敏感词过滤后增量入库。"""
+    _check_admin_token(x_admin_token)
+
+    # 文件名安全处理：仅取文件名部分（防路径穿越），校验扩展名
+    name = Path(req.filename.replace("\\", "/")).name
+    if not name.lower().endswith(ALLOWED_EXTENSIONS):
+        raise HTTPException(status_code=400, detail="仅支持 .md 或 .txt 文件")
+    if len(req.content) > MAX_UPLOAD_CHARS:
+        raise HTTPException(status_code=400, detail="文件过大（超过 20 万字符上限）")
+
+    # 敏感词过滤（内容投毒防护）：命中即拒绝，不落盘不入库
+    hit = next((w for w in SENSITIVE_WORDS if w in req.content or w in name), None)
+    if hit:
+        _audit_log("[upload] 拒绝入库：命中敏感词 question=%r", name)
+        raise HTTPException(status_code=400, detail=f"内容包含违规词“{hit}”，已拒绝入库")
+
+    # 落盘到 docs/uploads/ 并增量写入 ChromaDB
+    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    save_path = UPLOADS_DIR / name
+    save_path.write_text(req.content, encoding="utf-8")
+    stats = rag.add_document(save_path)
+    _audit_log(
+        "[upload] 入库成功 source=%r added=%d", stats["source"], stats["added"]
+    )
+    return {"ok": True, "source": stats["source"], "added": stats["added"]}
+
+
+@app.get("/documents")
+def documents(x_admin_token: Optional[str] = Header(default=None)) -> dict:
+    """列出知识库当前所有不重复的文档来源名（需管理员鉴权）。"""
+    _check_admin_token(x_admin_token)
+    return {"documents": rag.list_sources()}
 
 
 # 静态文件挂载必须放在所有 API 路由之后，否则 /ask、/health 会被静态路由拦截

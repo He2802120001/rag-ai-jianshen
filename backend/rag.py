@@ -26,7 +26,11 @@ from backend.config import (
     DOC_CATEGORIES,
     EMBEDDING_MODEL_NAME,
     TOP_K,
+    UPLOADS_DIR_NAME,
 )
+
+# 动态上传文档的 category（检索时始终与主领域一起参与）
+UPLOAD_CATEGORY = UPLOADS_DIR_NAME
 
 # 检索相似度阈值：低于该相似度视为信息不足，追问而非硬答
 # ChromaDB cosine 距离(d) ∈ [0,2]，相似度取 1-d；阈值 0.5 对应 d <= 0.5
@@ -60,7 +64,8 @@ SYSTEM_PROMPT = """你是一位经验丰富、耐心且专业的健身教练，�
 - 以【文档：《名称》】标出的文档内容为主要依据；文档未覆盖的部分，
   可以补充通用的、无争议的健身常识，但不要编造具体数据、研究或医疗建议；
 - 绝对禁止出现"片段1""片段2""片段3"或"依据片段…"这类字眼，任何情况下都不允许；
-- 需要说明依据时，请使用自然表达，例如："根据《文档名》的资料显示，……"；
+- 引用资料时必须使用文档的中文全称（如"根据《NSCA 卧推技术详解》的说明，……"），
+  绝不要使用英文文件名或自造缩写；
 - 只能引用列出的文档名，不要编造或改写文档名；
 - 仅当所有文档内容都与问题明显无关时，才直说资料覆盖不到；只要有部分相关，
   就基于相关部分展开作答。
@@ -173,6 +178,49 @@ def build_index() -> dict:
     for d in docs:
         cat_count[d["category"]] = cat_count.get(d["category"], 0) + 1
     return {"added": len(ids), "chunks": len(texts), "categories": cat_count}
+
+
+def add_document(md_path: Path, category: str = UPLOAD_CATEGORY) -> dict:
+    """动态增量入库：读取单个文档，切块、向量化后写入 ChromaDB（不重建全库）。
+
+    同名文档重复上传时先删旧块再写入（替换语义），避免产生重复向量。
+    返回 {"added": 块数, "source": 入库的 source 路径}。
+    """
+    source = str(md_path.relative_to(DOCS_DIR.parent))
+    content = md_path.read_text(encoding="utf-8")
+    chunks = [c.strip() for c in _chunk_text(content)]
+    chunks = [c for c in chunks if c and c not in _MD_MARKERS]
+    if not chunks:
+        return {"added": 0, "source": source}
+
+    collection = _get_collection()
+    try:
+        collection.delete(where={"source": source})
+    except Exception:
+        pass  # 首次上传时无旧块可删
+    ids = [f"{category}:{md_path.stem}:{idx}" for idx in range(len(chunks))]
+    metadatas = [{"source": source, "category": category}] * len(chunks)
+    embeddings = _embed(chunks)
+    collection.add(ids=ids, embeddings=embeddings, documents=chunks, metadatas=metadatas)
+    return {"added": len(ids), "source": source}
+
+
+def list_sources() -> list[str]:
+    """返回库中所有不重复的文档来源名（source），按字典序排序。"""
+    collection = _get_collection()
+    got = collection.get(include=["metadatas"])
+    return sorted({m.get("source", "") for m in got["metadatas"]} - {""})
+
+
+def _search_categories(category: str) -> list[str] | None:
+    """根据意图类别确定检索目录：主领域 + 动态上传库。
+
+    上传的通用文档不属于三大领域，但应始终参与检索，
+    否则动态添加的知识永远无法被引用。
+    """
+    if category in ("technique", "nutrition", "injury-prevention"):
+        return [category, UPLOAD_CATEGORY]
+    return None
 
 
 def retrieve(query: str, top_k: int = TOP_K, categories: list[str] | None = None) -> list[dict]:
@@ -296,8 +344,8 @@ def answer(query: str, top_k: int = TOP_K, history: list[dict] | None = None) ->
             "clarify": True,
         }
 
-    # 3) 正常类：按类别目录限定检索（单目录；跨类检索留待后续）
-    categories = [category] if category in ("technique", "nutrition", "injury-prevention") else None
+    # 3) 正常类：按类别目录限定检索（主领域 + 动态上传库）
+    categories = _search_categories(category)
     hits = retrieve(merged, top_k=top_k, categories=categories)
 
     # 相似度不足 → 追问而非硬答。
@@ -365,7 +413,7 @@ def answer_stream(
         return
 
     # 3) 正常类：检索（实体词豁免相似度阈值，与 answer() 一致）
-    categories = [category] if category in ("technique", "nutrition", "injury-prevention") else None
+    categories = _search_categories(category)
     hits = retrieve(merged, top_k=top_k, categories=categories)
     low_sim = not hits or (
         hits[0]["similarity"] < SIMILARITY_THRESHOLD and not has_domain_entity(query)
