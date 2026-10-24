@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>健身问答助手</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <nav class="topbar">
+    <div class="topbar-inner">
+      <div class="topbar-brand">
+        <span class="topbar-logo">FIT</span>
+        <span class="topbar-name">健身问答助手</span>
+      </div>
+      <span class="topbar-badge">仅限动作技术 / 营养原则 / 伤病预防</span>
+    </div>
+  </nav>
+
+  <div class="layout">
+    <!-- 左侧边栏 -->
+    <aside class="sidebar">
+      <section class="side-block">
+        <h2 class="side-title">快捷问题</h2>
+        <div class="quick-groups" id="quickList">
+          <div class="quick-group">
+            <div class="quick-group-title"><span class="dot dot-tech"></span>动作技术</div>
+            <ul class="quick-list">
+              <li><button class="quick-item" data-q="深蹲膝盖能不能过脚尖？">深蹲膝盖能不能过脚尖？</button></li>
+              <li><button class="quick-item" data-q="卧推手腕疼怎么办？">卧推手腕疼怎么办？</button></li>
+            </ul>
+          </div>
+          <div class="quick-group">
+            <div class="quick-group-title"><span class="dot dot-nut"></span>营养补充</div>
+            <ul class="quick-list">
+              <li><button class="quick-item" data-q="减脂期一天吃多少蛋白质？">减脂期一天吃多少蛋白质？</button></li>
+              <li><button class="quick-item" data-q="练完马上吃东西吗？">练完马上吃东西吗？</button></li>
+            </ul>
+          </div>
+          <div class="quick-group">
+            <div class="quick-group-title"><span class="dot dot-inj"></span>伤病预防</div>
+            <ul class="quick-list">
+              <li><button class="quick-item" data-q="深蹲前怎么热身？">深蹲前怎么热身？</button></li>
+              <li><button class="quick-item" data-q="怎么预防肩膀受伤？">怎么预防肩膀受伤？</button></li>
+            </ul>
+          </div>
+          <div class="quick-group">
+            <div class="quick-group-title"><span class="dot dot-guard"></span>安全拦截</div>
+            <ul class="quick-list">
+              <li><button class="quick-item" data-q="我腰椎间盘突出还能深蹲吗？">我腰椎间盘突出还能深蹲吗？</button></li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <section class="side-block">
+        <h2 class="side-title">可以问什么</h2>
+        <ul class="scope-list">
+          <li><span class="dot dot-tech"></span><span>动作技术 —— 深蹲、硬拉、卧推等要领</span></li>
+          <li><span class="dot dot-nut"></span><span>营养原则 —— 蛋白质、减脂增肌摄入</span></li>
+          <li><span class="dot dot-inj"></span><span>伤病预防 —— 热身、恢复、训练量</span></li>
+          <li><span class="dot dot-guard"></span><span>安全拦截 —— 伤病诊断、用药、特殊人群</span></li>
+        </ul>
+      </section>
+    </aside>
+
+    <!-- 右侧对话区 -->
+    <main class="main">
+      <div class="chat" id="chat"></div>
+
+      <footer class="composer">
+        <div class="composer-row">
+          <textarea
+            id="input"
+            class="composer-input"
+            rows="1"
+            placeholder="输入你的问题…"
+            autocomplete="off"
+            aria-label="输入问题"
+          ></textarea>
+          <button id="send" class="composer-btn" type="button" aria-label="发送">
+            <span class="btn-label">发送</span>
+          </button>
+        </div>
+      </footer>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
