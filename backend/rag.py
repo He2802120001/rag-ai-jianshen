@@ -177,6 +177,7 @@ def build_index() -> dict:
     cat_count: dict[str, int] = {}
     for d in docs:
         cat_count[d["category"]] = cat_count.get(d["category"], 0) + 1
+    _reset_bm25()  # 全量重建后 id 集合已变，BM25 缓存失效待重建
     return {"added": len(ids), "chunks": len(texts), "categories": cat_count}
 
 
@@ -202,6 +203,7 @@ def add_document(md_path: Path, category: str = UPLOAD_CATEGORY) -> dict:
     metadatas = [{"source": source, "category": category}] * len(chunks)
     embeddings = _embed(chunks)
     collection.add(ids=ids, embeddings=embeddings, documents=chunks, metadatas=metadatas)
+    _reset_bm25()  # 新文档入库后 BM25 缓存失效，下次检索自动带上新内容
     return {"added": len(ids), "source": source}
 
 
@@ -223,41 +225,149 @@ def _search_categories(category: str) -> list[str] | None:
     return None
 
 
-def retrieve(query: str, top_k: int = TOP_K, categories: list[str] | None = None) -> list[dict]:
-    """编码 query，从 ChromaDB 检索 top_k 片段。
+# ---- 混合检索（Hybrid Search：向量 + BM25 + RRF）----
+HYBRID_FETCH = 10  # 两路通道各取的候选数
+RRF_K = 60         # Reciprocal Rank Fusion 的平滑常数：score = Σ 1/(k + rank)
 
-    返回 [{text, source, category, distance, similarity}]。
-    categories：若给定，则按类别过滤检索目录（如仅检索 technique）。
+# 内存 BM25 索引缓存：{"index", "chunks", "id2chunk"}；None 表示未构建或不可用
+_BM25_STATE: dict | None = None
+
+
+def _reset_bm25() -> None:
+    """文档增删/重建索引后使 BM25 缓存失效，下次检索时自动重建。"""
+    global _BM25_STATE
+    _BM25_STATE = None
+
+
+def _get_bm25() -> dict:
+    """惰性构建内存 BM25 索引：分块与 ChromaDB 的 id 一一对应。
+
+    jieba / rank_bm25 延迟导入，依赖缺失或构建失败时向上抛异常，
+    由 retrieve() 降级为纯向量检索，绝不影响主链路。
+    文档名（如《NSCA 深蹲技术详解》）是人工编写的高密度关键词，一并参与索引，
+    让"NSCA/ISSN/ACSM"等机构缩写能被关键词通道精确命中。
     """
-    if not query.strip():
-        return []
+    global _BM25_STATE
+    if _BM25_STATE is not None:
+        return _BM25_STATE
+    import jieba
+    import rank_bm25
+
     collection = _get_collection()
-    q_emb = _embed([query.strip()])[0]
-    where = None
-    if categories:
-        # ChromaDB where 过滤：category 属于给定集合
-        where = {"category": {"$in": list(categories)}}
-    result = collection.query(
-        query_embeddings=[q_emb],
-        n_results=top_k,
-        where=where,
-        include=["documents", "metadatas", "distances"],
-    )
-    hits: list[dict] = []
-    docs = result["documents"][0]
-    metas = result["metadatas"][0]
-    dists = result["distances"][0]
-    for text, meta, dist in zip(docs, metas, dists):
-        d = float(dist)
-        hits.append(
+    got = collection.get(include=["documents", "metadatas"])
+    corpus = []
+    chunks = []
+    for cid, text, meta in zip(got["ids"], got["documents"], got["metadatas"]):
+        doc_name = Path(meta.get("source", "")).stem
+        corpus.append(list(jieba.cut_for_search(text + " " + doc_name)))
+        chunks.append(
             {
+                "id": cid,
                 "text": text,
                 "source": meta.get("source", ""),
                 "category": meta.get("category", ""),
-                "distance": d,
-                "similarity": 1.0 - d,
             }
         )
+    index = rank_bm25.BM25Okapi(corpus)
+    _BM25_STATE = {"index": index, "chunks": chunks, "id2chunk": {c["id"]: c for c in chunks}}
+    return _BM25_STATE
+
+
+def retrieve(query: str, top_k: int = TOP_K, categories: list[str] | None = None) -> list[dict]:
+    """混合检索：向量 Top10 + BM25 Top10 → RRF 融合取 Top-K。
+
+    返回 [{text, source, category, distance, similarity, rrf, vec_rank, bm25_rank}]。
+    - categories 同时约束两路通道；
+    - BM25 构建/检索任何异常都自动降级为纯向量检索；
+    - 仅 BM25 命中（向量未进前列）的块 similarity 记 0.5，
+      避免因缺少向量分被相似度阈值误判为低质。
+    """
+    q = query.strip()
+    if not q:
+        return []
+    collection = _get_collection()
+    q_emb = _embed([q])[0]
+    where = {"category": {"$in": list(categories)}} if categories else None
+    fetch = max(HYBRID_FETCH, top_k)
+
+    # ---- A) 向量通道：ChromaDB 取 Top fetch（query 结果默认携带 ids）----
+    result = collection.query(
+        query_embeddings=[q_emb],
+        n_results=fetch,
+        where=where,
+        include=["documents", "metadatas", "distances"],
+    )
+    vec_hits: dict[str, dict] = {}
+    vec_order: list[str] = []
+    for cid, text, meta, dist in zip(
+        result["ids"][0], result["documents"][0], result["metadatas"][0], result["distances"][0]
+    ):
+        d = float(dist)
+        vec_order.append(cid)
+        vec_hits[cid] = {
+            "text": text,
+            "source": meta.get("source", ""),
+            "category": meta.get("category", ""),
+            "distance": d,
+            "similarity": 1.0 - d,
+        }
+
+    # ---- B) 关键词通道：BM25 取 Top fetch（异常降级 → bm_order 为空）----
+    bm_order: list[str] = []
+    bm: dict | None = None
+    try:
+        bm = _get_bm25()
+        import jieba
+
+        tokens = list(jieba.cut_for_search(q))
+        scores = bm["index"].get_scores(tokens)
+        order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+        allowed = set(categories) if categories else None
+        for i in order:
+            if len(bm_order) >= fetch:
+                break
+            if scores[i] <= 0:
+                continue
+            chunk = bm["chunks"][i]
+            if allowed is not None and chunk["category"] not in allowed:
+                continue
+            bm_order.append(chunk["id"])
+    except Exception:
+        bm = None
+
+    # ---- 降级：BM25 不可用时直接返回纯向量结果 ----
+    if not bm_order:
+        hits = [dict(vec_hits[cid]) for cid in vec_order[:top_k]]
+        for h in hits:
+            h.setdefault("rrf", None)
+            h.setdefault("vec_rank", None)
+            h.setdefault("bm25_rank", None)
+        return hits
+
+    # ---- C) RRF 融合：score = Σ 1/(k + rank)，按 id 合并两路排名 ----
+    fused: dict[str, float] = {}
+    for rank_list in (vec_order, bm_order):
+        for rank, cid in enumerate(rank_list, start=1):
+            fused[cid] = fused.get(cid, 0.0) + 1.0 / (RRF_K + rank)
+    top_ids = sorted(fused, key=fused.get, reverse=True)[:top_k]
+
+    hits = []
+    for cid in top_ids:
+        if cid in vec_hits:
+            hit = dict(vec_hits[cid])
+        else:
+            chunk = bm["id2chunk"][cid]
+            hit = {
+                "text": chunk["text"],
+                "source": chunk["source"],
+                "category": chunk["category"],
+                "distance": 0.5,
+                "similarity": 0.5,
+            }
+        hit["rrf"] = round(fused[cid], 5)
+        hit["vec_rank"] = vec_order.index(cid) + 1 if cid in vec_order else None
+        hit["bm25_rank"] = bm_order.index(cid) + 1 if cid in bm_order else None
+        hits.append(hit)
     return hits
 
 
@@ -463,4 +573,17 @@ def answer_stream(
         delta = chunk.choices[0].delta.content
         if delta:
             yield _sse({"text": delta})
-    yield _sse({"sources": [{"text": h["text"], "source": h["source"]} for h in hits]})
+    yield _sse(
+        {
+            "sources": [
+                {
+                    "text": h["text"],
+                    "source": h["source"],
+                    "rrf": h.get("rrf"),
+                    "vec_rank": h.get("vec_rank"),
+                    "bm25_rank": h.get("bm25_rank"),
+                }
+                for h in hits
+            ]
+        }
+    )
