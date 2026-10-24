@@ -8,6 +8,7 @@ from typing import List, Optional
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -73,6 +74,20 @@ def ask(req: AskRequest) -> dict:
         len(result.get("answer", "")),
     )
     return result
+
+
+@app.post("/ask_stream")
+def ask_stream(req: AskRequest) -> StreamingResponse:
+    """流式问答：SSE 事件流。事件协议见 rag.answer_stream 文档字符串。
+
+    保留 POST /ask 不变（非流式），供评估脚本继续使用。
+    """
+    _audit_log("[ask_stream] question=%r history=[%s]", req.question, _hist_summary(req.history))
+    return StreamingResponse(
+        rag.answer_stream(req.question, history=req.history or None),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 # 静态文件挂载必须放在所有 API 路由之后，否则 /ask、/health 会被静态路由拦截

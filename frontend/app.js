@@ -7,13 +7,9 @@
   const btnLabel = sendBtn.querySelector(".btn-label");
 
   let busy = false;
+  let currentController = null; // 当前流式请求的 AbortController
   // 多轮上下文：只保留最近 3 轮（用户/助手各 3 条），刷新清空
   let messages = [];
-
-  // ---------- 打字机参数 ----------
-  const TYPE_SPEED_MS = 18;      // 每字 18ms ≈ 55 字/秒（略快于感知阈值，更跟手）
-  const PUNCT_PAUSE_MS = 110;    // 句读处停顿，更像真人说话
-  const PUNCT = "。！？!?\n；;，,、—…";
 
   // ---------- 头像 SVG ----------
   const USER_AVATAR_SVG =
@@ -31,7 +27,7 @@
     return pad(d.getHours()) + ":" + pad(d.getMinutes());
   }
 
-  // 平滑滚动：新消息出现时无条件到底；打字机推进时仅在用户位于底部附近才跟随，
+  // 平滑滚动：新消息出现时无条件到底；流式推进时仅在用户位于底部附近才跟随，
   // 避免用户上翻查看历史时被不断拽回底部
   function isNearBottom() {
     return chat.scrollHeight - chat.scrollTop - chat.clientHeight < 120;
@@ -114,30 +110,6 @@
     messages.push({ role: "user", content: text });
   }
 
-  // ---------- 打字机 ----------
-  // 逐字推进，每次用「原始文本前缀」重新走一遍白名单渲染，保证 **加粗** / 换行
-  // 在标记闭合前后都显示正确；光标跟随到最后一个字，结束后移除
-  function typeInto(el, text, onDone) {
-    let i = 0;
-    const chunk = text.length > 240 ? 2 : 1; // 长回答每次多走一字，避免等太久
-    const cursor = document.createElement("span");
-    cursor.className = "type-cursor";
-    function step() {
-      i += chunk;
-      el.innerHTML = renderAnswer(text.slice(0, i));
-      el.appendChild(cursor);
-      followScroll();
-      if (i >= text.length) {
-        el.innerHTML = renderAnswer(text); // 最终完整渲染，移除光标
-        if (onDone) onDone();
-        return;
-      }
-      const pause = PUNCT.includes(text[i - 1]) ? PUNCT_PAUSE_MS : TYPE_SPEED_MS;
-      setTimeout(step, pause);
-    }
-    step();
-  }
-
   function appendSources(bubble, sources) {
     if (!sources || !sources.length) return;
     const src = document.createElement("div");
@@ -165,36 +137,6 @@
     bubble.appendChild(src);
   }
 
-  // onTyped：打字机播完后的回调（用于解锁输入框）
-  function addAssistant(data, onTyped) {
-    const { wrap, body } = makeMsg("assistant");
-    const bubble = document.createElement("div");
-    bubble.className = "bubble";
-    if (data.refused || data.clarify) {
-      bubble.classList.add(data.refused ? "is-refused" : "is-clarify", "has-flag");
-      const flag = document.createElement("span");
-      flag.className = "flag " + (data.refused ? "flag-refused" : "flag-clarify");
-      flag.textContent = data.refused ? "\u26A0\uFE0F 已拦截" : "\u2753 需要补充信息";
-      bubble.appendChild(flag);
-    }
-
-    const answerText = document.createElement("div");
-    answerText.className = "answer-text";
-    bubble.appendChild(answerText);
-    body.appendChild(bubble);
-    chat.appendChild(wrap);
-    scrollToBottom();
-
-    // 记录助手回答（refuse/clarify 也记录，供后续轮次引用）
-    messages.push({ role: "assistant", content: data.answer || "" });
-
-    // 打字机输出，播完后追加来源标签并回调
-    typeInto(answerText, data.answer || "", () => {
-      appendSources(bubble, data.sources);
-      if (onTyped) onTyped();
-    });
-  }
-
   function addError(msg) {
     const { wrap, body } = makeMsg("assistant");
     const bubble = document.createElement("div");
@@ -219,46 +161,152 @@
     return wrap;
   }
 
-  // ---------- 请求 ----------
-  function lockInput() {
-    busy = true;
-    sendBtn.disabled = true;
-    sendBtn.classList.add("is-loading");
-    input.disabled = true;
-  }
-  function unlockInput() {
-    busy = false;
-    sendBtn.disabled = false;
-    sendBtn.classList.remove("is-loading");
-    input.disabled = false;
-    input.focus();
-  }
-
+  // ---------- 流式问答 ----------
   async function ask(text) {
-    lockInput();
+    busy = true;
+    currentController = new AbortController();
+    input.disabled = true;
+    // 发送按钮切换为「停止」
+    sendBtn.classList.add("is-stop");
+    sendBtn.classList.remove("is-loading");
+    btnLabel.textContent = "停止";
+    sendBtn.setAttribute("aria-label", "停止生成");
 
     addUser(text);
     const typingWrap = addTyping();
-
     // 携带最近 3 轮历史（最多 6 条），排除刚加入的当前问题（它在 question 字段里）
     const history = messages.slice(0, -1).slice(-6);
 
+    let meta = null;        // 首个事件：分类与标志位
+    let buf = "";           // 累积的回答文本
+    let sources = [];       // 收尾事件：引用来源
+    let bubble = null;      // AI 气泡（收到 meta 时创建）
+    let answerText = null;  // 气泡内文本节点
+    let cursor = null;      // 流式期间的闪烁光标
+    let stopped = false;    // 用户主动停止
+    let errored = false;
+    let lastRender = 0;
+
+    // 流式渲染（30ms 节流）：force 时做终帧渲染并移除光标
+    function renderStreamed(force) {
+      if (!answerText) return;
+      const now = Date.now();
+      if (!force && now - lastRender < 30) return;
+      lastRender = now;
+      answerText.innerHTML = renderAnswer(buf);
+      if (!force && cursor) answerText.appendChild(cursor);
+      followScroll();
+    }
+
+    function onEvent(payload) {
+      if (payload.meta) {
+        meta = payload.meta;
+        typingWrap.remove();
+        const m = makeMsg("assistant");
+        bubble = document.createElement("div");
+        bubble.className = "bubble";
+        if (meta.refused || meta.clarify) {
+          bubble.classList.add(meta.refused ? "is-refused" : "is-clarify", "has-flag");
+          const flag = document.createElement("span");
+          flag.className = "flag " + (meta.refused ? "flag-refused" : "flag-clarify");
+          flag.textContent = meta.refused ? "\u26A0\uFE0F 已拦截" : "\u2753 需要补充信息";
+          bubble.appendChild(flag);
+        }
+        answerText = document.createElement("div");
+        answerText.className = "answer-text";
+        bubble.appendChild(answerText);
+        m.body.appendChild(bubble);
+        chat.appendChild(m.wrap);
+        cursor = document.createElement("span");
+        cursor.className = "type-cursor";
+        scrollToBottom();
+        return;
+      }
+      if (typeof payload.text === "string") {
+        buf += payload.text;
+        renderStreamed(false);
+        return;
+      }
+      if (payload.sources) {
+        sources = payload.sources;
+      }
+    }
+
     try {
-      const resp = await fetch("/ask", {
+      const resp = await fetch("/ask_stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ question: text, history }),
+        signal: currentController.signal,
       });
       if (!resp.ok) throw new Error("服务错误 (" + resp.status + ")");
-      const data = await resp.json();
-      typingWrap.remove();
-      // 打字机播完后再解锁输入框，避免打字未完就发送下一条
-      addAssistant(data, unlockInput);
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let sseBuf = "";
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        sseBuf += decoder.decode(value, { stream: true });
+        // SSE 事件以空行分隔；一条事件内可能有多个 data: 行
+        let sep;
+        while ((sep = sseBuf.indexOf("\n\n")) >= 0) {
+          const rawEvent = sseBuf.slice(0, sep);
+          sseBuf = sseBuf.slice(sep + 2);
+          for (const line of rawEvent.split("\n")) {
+            if (!line.startsWith("data:")) continue;
+            try {
+              onEvent(JSON.parse(line.slice(5).trim()));
+            } catch (e) {
+              /* 单条坏事件不中断整个流 */
+            }
+          }
+        }
+      }
     } catch (err) {
-      typingWrap.remove();
-      addError((err && err.message) || "网络异常，请稍后重试");
-      unlockInput();
+      if (err && err.name === "AbortError") {
+        stopped = true;
+      } else {
+        errored = true;
+        typingWrap.remove();
+        addError((err && err.message) || "网络异常，请稍后重试");
+      }
     }
+
+    // ---------- 收尾 ----------
+    if (!bubble && stopped) {
+      // 首个事件还没到就点了停止：仍给一个气泡承载「已停止」提示
+      typingWrap.remove();
+      const m = makeMsg("assistant");
+      bubble = document.createElement("div");
+      bubble.className = "bubble";
+      m.body.appendChild(bubble);
+      chat.appendChild(m.wrap);
+    }
+    if (bubble) {
+      renderStreamed(true); // 终帧：完整渲染并移除光标
+      if (sources && sources.length) appendSources(bubble, sources);
+      if (stopped) {
+        const note = document.createElement("div");
+        note.className = "stopped-note";
+        note.textContent = "\u23F9 已停止生成";
+        bubble.appendChild(note);
+      }
+    } else if (!stopped && !errored) {
+      // 流正常结束却连 meta 都没收到（如服务端中途断流）
+      typingWrap.remove();
+      addError("未收到任何内容，连接可能中断，请重试");
+    }
+    // 记录助手回答（含被停止的部分内容），供后续轮次引用
+    if (buf) messages.push({ role: "assistant", content: buf });
+
+    busy = false;
+    currentController = null;
+    input.disabled = false;
+    sendBtn.classList.remove("is-stop");
+    btnLabel.textContent = "发送";
+    sendBtn.setAttribute("aria-label", "发送");
+    input.focus();
   }
 
   function sendCurrent() {
@@ -277,7 +325,14 @@
   input.addEventListener("input", autoGrow);
 
   // ---------- 事件 ----------
-  sendBtn.addEventListener("click", sendCurrent);
+  // 流式期间按钮是「停止」；空闲时是「发送」
+  sendBtn.addEventListener("click", () => {
+    if (busy) {
+      if (currentController) currentController.abort();
+      return;
+    }
+    sendCurrent();
+  });
   input.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();

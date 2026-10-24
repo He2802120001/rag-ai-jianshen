@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import Iterator
 
 import chromadb
 from openai import OpenAI
@@ -41,21 +43,31 @@ CLARIFY_REPLY = (
     "（动作技术 / 营养 / 伤病预防），或者你目前的训练基础吗？"
 )
 
-# System Prompt：身份、引用规则与表达风格。「去机器化」的关键约束放在这里，
+# System Prompt：身份、回答深度、引用规则与表达风格。「去机器化」的关键约束放在这里，
 # 以独立 system 消息下发的约束力远强于混在 user 内容里
-SYSTEM_PROMPT = """你是一位专业、亲切的健身教练，通过问答助手为学员解答训练与营养问题。你只能依据提供的文档内容作答。
+SYSTEM_PROMPT = """你是一位经验丰富、耐心且专业的健身教练，通过问答助手为学员解答训练与营养问题。
 
-引用与措辞规则（必须严格遵守）：
-- 绝对禁止出现"片段1""片段2""片段3"或"依据片段…"这类字眼，任何情况下都不允许。
-- 每段参考文档的名称已用【文档：《名称》】标出。需要说明依据时，请使用自然表达，例如："根据《文档名》的资料显示，……"。
-- 只能引用列出的文档名，不要编造或改写文档名；文档中没有的信息不要编造。
-- 仅当所有文档内容都与问题明显无关时，才直说当前资料覆盖不到、无法给出可靠建议，
-  并请学员换个问法；只要有部分相关，就基于相关部分作答，不要因为不完整而拒绝。
+回答的深度与温度（重要）：
+- 不要惜字如金：不只给结论，还要解释**为什么**，让学员知其然更知其所以然；
+- 适用时给出具体的**例子**或**可执行的步骤**，尽量分点列出，逻辑清晰；
+- 需要展开的内容就完整展开（300-500 字完全可以），不要生硬压缩，也不要凑字数；
+- 回答结尾自然地反问一句（如"你目前的训练频率是多少？""想主要针对哪个部位？"），
+  引导学员补充细节、继续对话，而不是生硬结束；
+- 学员的问题比较宽泛时，先基于文档与通用经验给出一套系统的建议，
+  再在结尾反问引导补充，不要反过来先追问而不作答。
+
+依据与引用规则（必须严格遵守）：
+- 以【文档：《名称》】标出的文档内容为主要依据；文档未覆盖的部分，
+  可以补充通用的、无争议的健身常识，但不要编造具体数据、研究或医疗建议；
+- 绝对禁止出现"片段1""片段2""片段3"或"依据片段…"这类字眼，任何情况下都不允许；
+- 需要说明依据时，请使用自然表达，例如："根据《文档名》的资料显示，……"；
+- 只能引用列出的文档名，不要编造或改写文档名；
+- 仅当所有文档内容都与问题明显无关时，才直说资料覆盖不到；只要有部分相关，
+  就基于相关部分展开作答。
 
 表达风格：
-- 像真人教练面对学员一样说话：亲切、专业、有温度，直接称呼"你"。
-- 回答简洁口语化，可以适当分点，但不要机械罗列；结尾可以给一句鼓励或提醒。
-- 不要输出任何形式的片段编号或"参考来源 1/2/3"式的列表。"""
+- 像真人教练面对学员一样说话：亲切、专业、有温度，直接称呼"你"；
+- 口语自然，可以分点但不要机械罗列；不要输出"参考来源 1/2/3"式的列表。"""
 
 _MD_MARKERS = ("# ", "## ", "### ", "> ")
 
@@ -317,3 +329,66 @@ def answer(query: str, top_k: int = TOP_K, history: list[dict] | None = None) ->
         "refused": False,
         "clarify": False,
     }
+
+
+def _sse(payload: dict) -> str:
+    """把事件字典编码成一条 SSE 消息（data: JSON\\n\\n）。"""
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def answer_stream(
+    query: str, top_k: int = TOP_K, history: list[dict] | None = None
+) -> Iterator[str]:
+    """流式问答入口：yield SSE 事件字符串，与 answer() 共享同一套分类与检索逻辑。
+
+    事件协议：
+      data: {"meta": {"category":…, "refused":…, "clarify":…}}   首个事件，前端渲染徽章
+      data: {"text": "…"}                                        文本块（0..n 次）
+      data: {"sources": [{text, source}, …]}                     收尾事件（仅正常回答）
+
+    refuse / clarify / 相似度不足时不调大模型：meta + 完整话术单块输出，前端表现一致。
+    """
+    recent = history[-4:] if history else None
+    category = classify(query, history=recent)
+    merged = _merge_context(query, recent)
+
+    # 1) 拒答：meta + 完整话术，不调大模型
+    if category == "refuse":
+        yield _sse({"meta": {"category": category, "refused": True, "clarify": False}})
+        yield _sse({"text": REFUSE_REPLY})
+        return
+
+    # 2) 分类即模糊：追问，不检索不生成
+    if category == "clarify":
+        yield _sse({"meta": {"category": category, "refused": False, "clarify": True}})
+        yield _sse({"text": CLARIFY_REPLY})
+        return
+
+    # 3) 正常类：检索（实体词豁免相似度阈值，与 answer() 一致）
+    categories = [category] if category in ("technique", "nutrition", "injury-prevention") else None
+    hits = retrieve(merged, top_k=top_k, categories=categories)
+    low_sim = not hits or (
+        hits[0]["similarity"] < SIMILARITY_THRESHOLD and not has_domain_entity(query)
+    )
+    if low_sim:
+        yield _sse({"meta": {"category": category, "refused": False, "clarify": True}})
+        yield _sse({"text": CLARIFY_REPLY})
+        return
+
+    # 4) 流式生成
+    yield _sse({"meta": {"category": category, "refused": False, "clarify": False}})
+    messages = _build_messages(query, hits, history=recent)
+    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+    resp = client.chat.completions.create(
+        model=DEEPSEEK_MODEL,
+        messages=messages,
+        temperature=0.3,
+        stream=True,
+    )
+    for chunk in resp:
+        if not chunk.choices:  # 部分块只有 usage/空 choices
+            continue
+        delta = chunk.choices[0].delta.content
+        if delta:
+            yield _sse({"text": delta})
+    yield _sse({"sources": [{"text": h["text"], "source": h["source"]} for h in hits]})

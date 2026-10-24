@@ -83,6 +83,13 @@ _NUTRITION_KEYWORDS = (
 # 泛问 / 信息不足 → clarify（仅当没有任何领域信号时才落到这里）
 _CLARIFY_KEYWORDS = ("怎么安排", "该吃什么", "应该怎么", "怎么吃", "帮我")
 
+# 宽泛但有明确训练/营养意图：怎么才能练得更好 / 如何提升训练效果 / 怎么吃得更健康
+# 这类问题不 clarify，直接放行到领域类检索通用原则文档作答，结尾再引导补充细节
+_BROAD_INTENT_PATTERN = re.compile(
+    r"(怎么|如何|怎样|怎么才|怎样才|怎么能).{0,8}"
+    r"(练|训|更好|提升|进步|变强|效果|水平|吃|增肌|减脂|身材|肌肉|力量)"
+)
+
 _MIN_QUESTION_LEN = 5
 
 
@@ -103,12 +110,14 @@ def _domain_category(q: str) -> str | None:
 
 
 def has_domain_entity(question: str) -> bool:
-    """问题是否包含明确的领域实体词（动作技术 / 营养 / 伤病预防任一命中）。
+    """问题是否包含明确的领域实体词或宽泛训练/营养意图（动作技术 / 营养 / 伤病预防任一命中）。
 
-    用于 rag 的相似度兜底：有实体词的问题必须直接检索回答，
+    用于 rag 的相似度兜底：有领域信号的问题必须直接检索回答，
     绝不因检索相似度低而降级为 clarify。
     """
     q = (question or "").strip()
+    if _BROAD_INTENT_PATTERN.search(q):
+        return True
     return any(
         kw in q
         for kw in _TECHNIQUE_KEYWORDS + _NUTRITION_KEYWORDS + _INJURY_PREVENTION_KEYWORDS
@@ -124,7 +133,9 @@ def _llm_classify(question: str, history: list[dict] | None = None) -> str:
         "- injury-prevention：问热身/拉伸/恢复/伤病预防\n"
         "- refuse：仅当问题明确提出伤病诊断、治疗、用药、手术、康复、急性受伤"
         "（扭伤/拉伤/肿痛）的处理求助，或疾病/特殊人群（孕妇等）能否训练\n"
-        "- clarify：问题信息不足，无法确定具体想问什么\n"
+        "- clarify：完全看不出学员想问什么的空泛问题。"
+        "注意：宽泛但有明确训练/营养意图的问题（如“怎么才能练得更好”）应归 "
+        "technique/nutrition，而不是 clarify\n"
         "两条铁律（最高优先级，必须遵守）：\n"
         "1. 问题中出现任何领域实体词（蛋白质、碳水、减脂、增肌、深蹲、硬拉、"
         "卧推、热身、拉伸、预防、恢复等）时，必须归入对应领域类，绝不 clarify——"
@@ -185,6 +196,11 @@ def classify(question: str, history: list[dict] | None = None) -> str:
     domain = _domain_category(q)
     if domain:
         return domain
+
+    # 4.5) 宽泛但有明确训练/营养意图（"怎么才能练得更好"）：放行到领域类作答，
+    #      由通用原则文档 + 大模型展开回答，结尾引导补充细节，而非直接追问
+    if _BROAD_INTENT_PATTERN.search(q):
+        return "nutrition" if any(kw in q for kw in _NUTRITION_KEYWORDS) else "technique"
 
     # 5) 无任何领域信号的泛问 → clarify
     if any(kw in q for kw in _CLARIFY_KEYWORDS):
