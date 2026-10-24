@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>健身问答助手</title>
-  <link rel="stylesheet" href="/style.css?v=4" />
+  <link rel="stylesheet" href="/style.css?v=5" />
 </head>
 <body>
   <nav class="topbar">
@@ -20,6 +20,12 @@
   <div class="layout">
     <!-- 左侧边栏 -->
     <aside class="sidebar">
+      <section class="side-block">
+        <h2 class="side-title">历史对话</h2>
+        <button id="newChatBtn" class="new-chat-btn" type="button">＋ 新建对话</button>
+        <ul class="session-list" id="sessionList"></ul>
+      </section>
+
       <section class="side-block">
         <h2 class="side-title">快捷问题</h2>
         <div class="quick-groups" id="quickList">
@@ -138,6 +144,6 @@
   <!-- 全局 Toast 提示 -->
   <div id="toast" class="toast" hidden></div>
 
-  <script src="/app.js?v=4"></script>
+  <script src="/app.js?v=5"></script>
 </body>
 </html>

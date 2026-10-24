@@ -8,8 +8,12 @@
 
   let busy = false;
   let currentController = null; // 当前流式请求的 AbortController
-  // 多轮上下文：只保留最近 3 轮（用户/助手各 3 条），刷新清空
+  // 多轮上下文：当前会话的消息列表（刷新后从 localStorage 恢复）
   let messages = [];
+  // 多会话历史：[{ sessionId, title, messages, updatedAt }]，持久化在 localStorage
+  let sessions = [];
+  let currentSessionId = null;
+  const SESSIONS_KEY = "fitness_qa_sessions";
 
   // ---------- 头像 SVG ----------
   const USER_AVATAR_SVG =
@@ -59,7 +63,7 @@
   }
 
   // ---------- 消息构建 ----------
-  function makeMsg(role) {
+  function makeMsg(role, timeStr) {
     const wrap = document.createElement("div");
     wrap.className = "msg " + role;
 
@@ -78,7 +82,7 @@
 
     const time = document.createElement("div");
     time.className = "msg-time";
-    time.textContent = nowTime();
+    time.textContent = timeStr || nowTime();
     body.appendChild(time);
     return { wrap, body };
   }
@@ -107,7 +111,7 @@
     body.appendChild(bubble);
     chat.appendChild(wrap);
     scrollToBottom();
-    messages.push({ role: "user", content: text });
+    messages.push({ role: "user", content: text, t: nowTime() });
   }
 
   function appendSources(bubble, sources) {
@@ -135,6 +139,169 @@
     });
     bubble.appendChild(src);
   }
+
+  // ---------- 多会话历史管理（localStorage） ----------
+  const newChatBtn = document.getElementById("newChatBtn");
+  const sessionListEl = document.getElementById("sessionList");
+
+  function genId() {
+    return (crypto.randomUUID && crypto.randomUUID()) ||
+      Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+  }
+
+  // 会话标题：取该会话第一条用户消息的前 15 个字
+  function cutTitle(text) {
+    const t = String(text || "").trim();
+    if (!t) return "新对话";
+    return t.length > 15 ? t.slice(0, 15) + "…" : t;
+  }
+
+  function loadSessions() {
+    try {
+      const raw = localStorage.getItem(SESSIONS_KEY);
+      const arr = raw ? JSON.parse(raw) : [];
+      return Array.isArray(arr) ? arr : [];
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function saveSessions() {
+    try {
+      localStorage.setItem(SESSIONS_KEY, JSON.stringify(sessions));
+    } catch (e) {
+      /* 存储满等异常：静默降级为仅内存会话 */
+    }
+  }
+
+  // 当前会话同步入库：空会话不占列表位；标题实时取首条用户消息
+  function persistCurrent() {
+    const idx = sessions.findIndex((s) => s.sessionId === currentSessionId);
+    if (!messages.length) {
+      if (idx >= 0) {
+        sessions.splice(idx, 1);
+        saveSessions();
+        renderSessions();
+      }
+      return;
+    }
+    const firstUser = messages.find((m) => m.role === "user");
+    const sess = idx >= 0 ? sessions[idx] : { sessionId: currentSessionId };
+    sess.title = cutTitle(firstUser ? firstUser.content : "");
+    sess.messages = messages;
+    sess.updatedAt = Date.now();
+    if (idx < 0) sessions.push(sess);
+    saveSessions();
+    renderSessions();
+  }
+
+  // 历史会话列表：按更新时间倒序，最新的在最上面
+  function renderSessions() {
+    sessionListEl.innerHTML = "";
+    const sorted = [...sessions].sort((a, b) => b.updatedAt - a.updatedAt);
+    sorted.forEach((s) => {
+      const li = document.createElement("li");
+      li.className = "session-item" + (s.sessionId === currentSessionId ? " is-active" : "");
+
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "session-btn";
+      btn.title = s.title || "新对话";
+      btn.textContent = s.title || "新对话";
+      btn.addEventListener("click", () => switchTo(s.sessionId));
+
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "session-del";
+      del.setAttribute("aria-label", "删除会话");
+      del.textContent = "×";
+      del.addEventListener("click", (e) => {
+        e.stopPropagation();
+        deleteSession(s.sessionId);
+      });
+
+      li.appendChild(btn);
+      li.appendChild(del);
+      sessionListEl.appendChild(li);
+    });
+  }
+
+  // 从 messages 数组完整重放当前会话的气泡（含徽章与来源标签）
+  function renderHistory() {
+    chat.innerHTML = "";
+    messages.forEach((m) => {
+      const { wrap, body } = makeMsg(m.role, m.t);
+      const bubble = document.createElement("div");
+      bubble.className = "bubble";
+      if (m.role === "user") {
+        bubble.textContent = m.content;
+      } else {
+        if (m.refused || m.clarify) {
+          bubble.classList.add(m.refused ? "is-refused" : "is-clarify", "has-flag");
+          const flag = document.createElement("span");
+          flag.className = "flag " + (m.refused ? "flag-refused" : "flag-clarify");
+          flag.textContent = m.refused ? "\u26A0\uFE0F 已拦截" : "\u2753 需要补充信息";
+          bubble.appendChild(flag);
+        }
+        const answerText = document.createElement("div");
+        answerText.className = "answer-text";
+        answerText.innerHTML = renderAnswer(m.content);
+        bubble.appendChild(answerText);
+        if (m.sources && m.sources.length) appendSources(bubble, m.sources);
+      }
+      body.appendChild(bubble);
+      chat.appendChild(wrap);
+    });
+    if (!messages.length) addWelcome();
+  }
+
+  function switchTo(id) {
+    if (busy) {
+      showToast("回答生成中，请先停止或等待完成", false);
+      return;
+    }
+    const sess = sessions.find((s) => s.sessionId === id);
+    if (!sess) return;
+    persistCurrent(); // 保存刚离开的会话
+    currentSessionId = id;
+    messages = sess.messages;
+    renderHistory();
+    renderSessions();
+    chat.scrollTop = chat.scrollHeight; // 恢复时直接定位到底部，不做平滑动画
+  }
+
+  function newChat() {
+    if (busy) {
+      showToast("回答生成中，请先停止或等待完成", false);
+      return;
+    }
+    persistCurrent(); // 进行中的对话先落库
+    currentSessionId = genId();
+    messages = [];
+    chat.innerHTML = "";
+    addWelcome();
+    renderSessions();
+    input.focus();
+  }
+
+  function deleteSession(id) {
+    const isCurrent = id === currentSessionId;
+    if (isCurrent && busy) {
+      showToast("回答生成中，请先停止或等待完成", false);
+      return;
+    }
+    sessions = sessions.filter((s) => s.sessionId !== id);
+    saveSessions();
+    if (isCurrent) {
+      currentSessionId = genId();
+      messages = [];
+      chat.innerHTML = "";
+      addWelcome();
+    }
+    renderSessions();
+  }
+
+  newChatBtn.addEventListener("click", newChat);
 
   function addError(msg) {
     const { wrap, body } = makeMsg("assistant");
@@ -172,9 +339,13 @@
     sendBtn.setAttribute("aria-label", "停止生成");
 
     addUser(text);
+    persistCurrent(); // 用户消息实时入 localStorage
     const typingWrap = addTyping();
     // 携带最近 3 轮历史（最多 6 条），排除刚加入的当前问题（它在 question 字段里）
-    const history = messages.slice(0, -1).slice(-6);
+    const history = messages
+      .slice(0, -1)
+      .slice(-6)
+      .map((m) => ({ role: m.role, content: m.content }));
 
     let meta = null;        // 首个事件：分类与标志位
     let buf = "";           // 累积的回答文本
@@ -297,8 +468,21 @@
       typingWrap.remove();
       addError("未收到任何内容，连接可能中断，请重试");
     }
-    // 记录助手回答（含被停止的部分内容），供后续轮次引用
-    if (buf) messages.push({ role: "assistant", content: buf });
+    // 记录助手回答（含被停止的部分内容），供后续轮次引用与会话恢复；
+    // 额外保存 refused/clarify 标志与来源（text 截断防 localStorage 膨胀）
+    if (buf) {
+      messages.push({
+        role: "assistant",
+        content: buf,
+        t: nowTime(),
+        refused: !!(meta && meta.refused),
+        clarify: !!(meta && meta.clarify),
+        sources: sources && sources.length
+          ? sources.map((s) => ({ source: s.source, text: String(s.text || "").slice(0, 120) }))
+          : undefined,
+      });
+    }
+    persistCurrent(); // 完成后同步 localStorage
 
     busy = false;
     currentController = null;
@@ -534,7 +718,20 @@
     uploadFile(file);
   });
 
-  // ---------- 初始化 ----------
-  addWelcome();
+  // ---------- 初始化：恢复最近会话，或开启新对话 ----------
+  sessions = loadSessions();
+  sessions.sort((a, b) => b.updatedAt - a.updatedAt);
+  if (sessions.length) {
+    const latest = sessions[0];
+    currentSessionId = latest.sessionId;
+    messages = latest.messages;
+    renderHistory();
+    chat.scrollTop = chat.scrollHeight;
+  } else {
+    currentSessionId = genId();
+    messages = [];
+    addWelcome();
+  }
+  renderSessions();
   input.focus();
 })();

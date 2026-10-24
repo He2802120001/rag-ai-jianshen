@@ -448,6 +448,93 @@ body {
   color: #b91c1c;
 }
 
+/* ===== 历史对话（多会话管理） ===== */
+.new-chat-btn {
+  width: 100%;
+  border: 1px dashed #b9cdf0;
+  background: linear-gradient(180deg, #f2f7ff 0%, #eaf1fe 100%);
+  color: var(--primary-strong);
+  font-size: 13px;
+  font-weight: 700;
+  padding: 10px 12px;
+  border-radius: 11px;
+  cursor: pointer;
+  margin-bottom: 10px;
+  transition: border-color 0.18s ease, background 0.18s ease, box-shadow 0.22s ease;
+}
+.new-chat-btn:hover {
+  border-color: var(--primary);
+  background: linear-gradient(180deg, #e8f1ff 0%, #dfeeff 100%);
+  box-shadow: 0 4px 14px var(--primary-glow);
+}
+
+/* 会话列表：独立滚动容器，滚动不穿透（防抖动三件套） */
+.session-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 208px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.session-list::-webkit-scrollbar { width: 5px; }
+.session-list::-webkit-scrollbar-track { background: transparent; }
+.session-list::-webkit-scrollbar-thumb { background: #d9e2ef; border-radius: 999px; }
+.session-list::-webkit-scrollbar-thumb:hover { background: #c3d0e4; }
+
+/* 会话条目：hover 只改颜色/背景（边框恒定 1px 宽，杜绝几何抖动） */
+.session-item {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  border-radius: 10px;
+  border: 1px solid transparent;
+  transition: background 0.16s ease, border-color 0.16s ease, box-shadow 0.16s ease;
+}
+.session-item:hover { background: rgba(37, 99, 235, 0.06); }
+.session-item.is-active {
+  background: var(--primary-weak);
+  border-color: #d4e4fb;
+  box-shadow: inset 3px 0 0 var(--primary);
+}
+.session-btn {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  text-align: left;
+  font-size: 12.5px;
+  color: var(--text);
+  padding: 8px 6px 8px 10px;
+  border-radius: 10px;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.session-btn:hover { color: var(--primary-strong); }
+.session-del {
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  border: none;
+  background: transparent;
+  border-radius: 7px;
+  color: var(--text-3);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.16s ease, background 0.16s ease, color 0.16s ease;
+}
+.session-item:hover .session-del,
+.session-del:focus-visible { opacity: 1; }
+.session-del:hover { background: #fee2e2; color: #dc2626; }
+
 /* ===== 知识库管理入口按钮 ===== */
 .admin-open-btn {
   flex-shrink: 0;
