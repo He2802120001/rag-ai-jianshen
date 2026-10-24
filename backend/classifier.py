@@ -23,18 +23,25 @@ CATEGORIES = ("technique", "nutrition", "injury-prevention", "refuse", "clarify"
 
 # ---------- refuse：必须显式命中医疗求助语义才拒答 ----------
 
-# 治疗 / 用药 / 手术 / 确诊 / 康复等明确医疗短语
+# 治疗 / 用药 / 手术 / 确诊 / 康复 / 违禁药物等明确医疗短语
 _MEDICAL_HELP_KEYWORDS = (
     "怎么治", "怎么治疗", "如何治疗", "吃什么药", "用什么药", "吃药", "用药",
-    "药物", "停药", "做手术", "能不能做手术", "要不要手术", "需要手术", "术后",
+    "药物", "停药", "开药", "药方", "类固醇", "激素", "兴奋剂",
+    "做手术", "能不能做手术", "要不要手术", "需要手术", "术后",
     "确诊", "诊断", "我得了", "患有", "就医", "看病", "康复", "严重吗",
 )
 
 # 疾病 / 特殊人群词：出现且伴随训练诉求（练/蹲/做/运动…）→ refuse
 _DISEASE_KEYWORDS = (
     "腰椎间盘突出", "腰突", "肩袖损伤", "肩袖撕裂", "腰肌劳损", "糖尿病",
-    "高血压", "低血压", "心脏病", "冠心病", "肾病", "肝病", "痛风", "哮喘",
-    "骨质疏松", "骨折", "滑膜炎", "肌腱炎", "关节炎", "疝气", "贫血", "颈椎病",
+    "高血压", "低血压", "血压高", "血压偏高", "血糖高", "血糖偏高", "血脂稠",
+    "心脏病", "冠心病", "肾病", "肝病", "痛风", "哮喘", "骨质疏松", "骨折",
+    "滑膜炎", "肌腱炎", "关节炎", "疝气", "贫血", "颈椎病",
+)
+# 疾病口语化/逆序变体兜底（F-01：防止"血压高/血糖偏高/心跳过快"这类词序
+# 颠倒或程度词拼接的表述漏过子串匹配）
+_DISEASE_PATTERN = re.compile(
+    r"(血压|血糖|尿酸|血脂)(偏高|过高|有点高|高|稠)" r"|(心跳|心率)(偏快|过快|很快|快)"
 )
 _SPECIAL_POP_KEYWORDS = ("孕妇", "怀孕", "孕期", "产后", "哺乳期", "生理期")
 _TRAIN_INTENT_PATTERN = re.compile(r"练|蹲|推|拉|做|动|健身|运动|训练|减脂|增肌")
@@ -49,11 +56,13 @@ _INJURY_HELP_PATTERN = re.compile(r"怎么办|怎么处理|怎么恢复|多久�
 
 def _is_refuse(q: str) -> bool:
     """仅当当前问题带有明确医疗求助语义时返回 True。"""
-    # 1) 治疗 / 用药 / 手术 / 确诊 / 康复类明确短语
+    # 1) 治疗 / 用药 / 手术 / 确诊 / 违禁药物类明确短语
     if any(kw in q for kw in _MEDICAL_HELP_KEYWORDS):
         return True
-    # 2) 疾病或特殊人群 + 训练诉求："腰椎间盘突出还能深蹲吗" / "孕妇能练吗"
-    if any(kw in q for kw in _DISEASE_KEYWORDS) and _TRAIN_INTENT_PATTERN.search(q):
+    # 2) 疾病（含口语逆序变体）或特殊人群 + 训练诉求：
+    #    "腰椎间盘突出还能深蹲吗" / "我血压高还能做硬拉吗" / "孕妇能练吗"
+    has_disease = any(kw in q for kw in _DISEASE_KEYWORDS) or bool(_DISEASE_PATTERN.search(q))
+    if has_disease and _TRAIN_INTENT_PATTERN.search(q):
         return True
     if any(kw in q for kw in _SPECIAL_POP_KEYWORDS) and _TRAIN_INTENT_PATTERN.search(q):
         return True
@@ -151,7 +160,7 @@ def _llm_classify(question: str, history: list[dict] | None = None) -> str:
             prompt += f"{role}：{h.get('content', '')[:80]}\n"
     prompt += f"当前问题：{question}"
     try:
-        client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+        client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL, timeout=60)
         resp = client.chat.completions.create(
             model=DEEPSEEK_MODEL,
             messages=[{"role": "user", "content": prompt}],

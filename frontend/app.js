@@ -355,6 +355,8 @@
     let cursor = null;      // 流式期间的闪烁光标
     let stopped = false;    // 用户主动停止
     let errored = false;
+    let timedOut = false;   // 看门狗超时（区别于用户主动停止）
+    let watchdog = null;    // 首事件看门狗：45 秒无任何事件则中止请求
     let lastRender = 0;
 
     // 流式渲染（30ms 节流）：force 时做终帧渲染并移除光标
@@ -369,6 +371,11 @@
     }
 
     function onEvent(payload) {
+      // 首个事件（meta 或文本）到达：看门狗解除武装
+      if (watchdog && (payload.meta || typeof payload.text === "string")) {
+        clearTimeout(watchdog);
+        watchdog = null;
+      }
       if (payload.meta) {
         meta = payload.meta;
         typingWrap.remove();
@@ -411,6 +418,12 @@
     }
 
     try {
+      // 看门狗：45 秒内未收到任何事件（LLM 挂起/网络黑洞）→ 中止并提示超时；
+      // 正常流一旦开始输出即解除，长回答的持续流式不受影响
+      watchdog = setTimeout(() => {
+        timedOut = true;
+        if (currentController) currentController.abort();
+      }, 45000);
       const resp = await fetch("/ask_stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -443,11 +456,23 @@
       }
     } catch (err) {
       if (err && err.name === "AbortError") {
-        stopped = true;
+        if (timedOut) {
+          // 看门狗触发的中止：提示超时，而非「已停止生成」
+          errored = true;
+          typingWrap.remove();
+          addError("服务响应超时，请稍后重试");
+        } else {
+          stopped = true;
+        }
       } else {
         errored = true;
         typingWrap.remove();
         addError((err && err.message) || "网络异常，请稍后重试");
+      }
+    } finally {
+      if (watchdog) {
+        clearTimeout(watchdog);
+        watchdog = null;
       }
     }
 

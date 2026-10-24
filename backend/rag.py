@@ -393,7 +393,7 @@ def rewrite_query(query: str, history: list[dict] | None) -> str:
         lines.append(f"{role}：{(h.get('content') or '')[:150]}")
     lines.append(f"当前问题：{query}")
     try:
-        client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+        client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL, timeout=60)
         resp = client.chat.completions.create(
             model=DEEPSEEK_MODEL,
             messages=[{"role": "user", "content": "\n".join(lines)}],
@@ -495,7 +495,7 @@ def answer(query: str, top_k: int = TOP_K, history: list[dict] | None = None) ->
         }
 
     messages = _build_messages(query, hits, history=recent)
-    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL, timeout=60)
     resp = client.chat.completions.create(
         model=DEEPSEEK_MODEL,
         messages=messages,
@@ -560,7 +560,7 @@ def answer_stream(
     # 4) 流式生成
     yield _sse({"meta": {"category": category, "refused": False, "clarify": False, "rewritten": rewritten}})
     messages = _build_messages(query, hits, history=recent)
-    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL, timeout=60)
     resp = client.chat.completions.create(
         model=DEEPSEEK_MODEL,
         messages=messages,
