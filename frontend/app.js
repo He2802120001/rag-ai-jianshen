@@ -581,14 +581,14 @@
   let adminToken = ""; // 会话内保存，刷新即清空
   let toastTimer = null;
 
-  function showToast(msg, ok) {
+  function showToast(msg, ok, duration) {
     toastEl.textContent = msg;
     toastEl.classList.toggle("is-error", !ok);
     toastEl.hidden = false;
     clearTimeout(toastTimer);
     toastTimer = setTimeout(() => {
       toastEl.hidden = true;
-    }, 2800);
+    }, duration || 2800);
   }
 
   function renderDocList(docs) {
@@ -676,35 +676,56 @@
     }
   }
 
-  async function uploadFile(file) {
-    if (!file) return;
-    const lower = file.name.toLowerCase();
-    if (!lower.endsWith(".md") && !lower.endsWith(".txt")) {
+  // 批量上传：一次选择/拖入多个文件，循环调用 /upload，带进度与汇总提示
+  let uploading = false;
+
+  async function uploadFiles(fileList) {
+    if (uploading) return; // 批次锁：上一批未完成时忽略新批次
+    const files = Array.from(fileList || []).filter((f) => /\.(md|txt)$/i.test(f.name));
+    if (!files.length) {
       showToast("仅支持 .md / .txt 文件", false);
       return;
     }
-    let content;
+    uploading = true;
+    let okCount = 0;
+    let failCount = 0;
+    let totalChunks = 0;
+    let firstFailMsg = "";
     try {
-      content = await file.text();
-    } catch (e) {
-      showToast("文件读取失败", false);
-      return;
-    }
-    try {
-      const resp = await fetch("/upload", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "X-Admin-Token": adminToken },
-        body: JSON.stringify({ filename: file.name, content }),
-      });
-      const data = await resp.json().catch(() => ({}));
-      if (resp.ok) {
-        showToast("✅ 《" + file.name.replace(/\.md$/i, "") + "》入库成功（" + data.added + " 块）", true);
-        refreshDocs();
-      } else {
-        showToast("❌ " + (data.detail || "上传失败"), false);
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        const shortName = file.name.replace(/\.(md|txt)$/i, "");
+        showToast("正在上传 " + (i + 1) + "/" + files.length + "：" + shortName, true, 6000);
+        try {
+          const content = await file.text();
+          const resp = await fetch("/upload", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-Admin-Token": adminToken },
+            body: JSON.stringify({ filename: file.name, content }),
+          });
+          const data = await resp.json().catch(() => ({}));
+          if (resp.ok) {
+            okCount++;
+            totalChunks += data.added || 0;
+          } else {
+            failCount++;
+            if (!firstFailMsg) firstFailMsg = data.detail || "上传失败";
+          }
+        } catch (e) {
+          failCount++;
+          if (!firstFailMsg) firstFailMsg = "网络异常";
+        }
       }
-    } catch (e) {
-      showToast("上传失败：网络异常", false);
+      if (failCount === 0) {
+        showToast("✅ 批量入库成功：" + okCount + " 个文件 / " + totalChunks + " 块", true, 4000);
+      } else if (okCount === 0) {
+        showToast("❌ 批量上传失败：" + firstFailMsg, false, 4000);
+      } else {
+        showToast("⚠️ 部分成功：成功 " + okCount + " / 失败 " + failCount + "（" + firstFailMsg + "）", false, 5000);
+      }
+      if (okCount > 0) refreshDocs();
+    } finally {
+      uploading = false;
     }
   }
 
@@ -730,7 +751,7 @@
     }
   });
   fileInput.addEventListener("change", () => {
-    uploadFile(fileInput.files[0]);
+    uploadFiles(fileInput.files);
     fileInput.value = "";
   });
   ["dragenter", "dragover"].forEach((ev) =>
@@ -746,8 +767,8 @@
     })
   );
   dropZone.addEventListener("drop", (e) => {
-    const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
-    uploadFile(file);
+    const files = e.dataTransfer && e.dataTransfer.files;
+    uploadFiles(files);
   });
 
   // ---------- 初始化：恢复最近会话，或开启新对话 ----------

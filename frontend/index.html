@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>健身问答助手</title>
-  <link rel="stylesheet" href="/style.css?v=7" />
+  <link rel="stylesheet" href="/style.css?v=8" />
 </head>
 <body>
   <nav class="topbar">
@@ -129,8 +129,8 @@
               <path d="M12 12v9" />
             </svg>
             <p class="drop-text">点击或将文件拖拽至此</p>
-            <p class="drop-sub">支持 .md / .txt，内容经敏感词校验后增量写入知识库</p>
-            <input id="fileInput" type="file" accept=".md,.txt" hidden />
+            <p class="drop-sub">支持 .md / .txt，可一次选择或拖入多个文件，经敏感词校验后增量入库</p>
+            <input id="fileInput" type="file" accept=".md,.txt" multiple hidden />
           </div>
         </div>
         <div class="admin-section">
@@ -144,6 +144,6 @@
   <!-- 全局 Toast 提示 -->
   <div id="toast" class="toast" hidden></div>
 
-  <script src="/app.js?v=7"></script>
+  <script src="/app.js?v=8"></script>
 </body>
 </html>
