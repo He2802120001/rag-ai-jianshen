@@ -382,6 +382,13 @@
           flag.textContent = meta.refused ? "\u26A0\uFE0F 已拦截" : "\u2753 需要补充信息";
           bubble.appendChild(flag);
         }
+        if (meta.rewritten) {
+          const rw = document.createElement("div");
+          rw.className = "rewrite-hint";
+          rw.title = "多轮追问已自动重写为独立完整的检索句";
+          rw.textContent = "\uD83D\uDD0E 已结合上下文优化检索：" + meta.rewritten;
+          bubble.appendChild(rw);
+        }
         answerText = document.createElement("div");
         answerText.className = "answer-text";
         bubble.appendChild(answerText);

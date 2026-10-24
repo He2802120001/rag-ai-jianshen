@@ -261,21 +261,44 @@ def retrieve(query: str, top_k: int = TOP_K, categories: list[str] | None = None
     return hits
 
 
-def _merge_context(query: str, history: list[dict] | None) -> str:
-    """把最近的历史对话与当前问题合并成一段上下文，用于分类与检索。"""
-    if not history:
-        return query
-    parts = []
-    for h in history:
-        role = "用户" if h.get("role") == "user" else "助手"
-        parts.append(f"{role}：{h.get('content', '')}")
-    parts.append(f"用户当前问题：{query}")
-    return "\n".join(parts)
-
-
 def _doc_name(source: str) -> str:
     """从 source 提取文档名（去路径、去 .md 后缀）。如 docs/technique/protein-intake.md → protein-intake。"""
     return Path(source).stem if source else ""
+
+
+def rewrite_query(query: str, history: list[dict] | None) -> str:
+    """多轮 Query Rewrite：结合历史把追问重写为独立完整的检索句。
+
+    例如历史"深蹲怎么做"+ 当前"对膝盖好吗" → "深蹲对膝盖好吗"，
+    解决追问缺乏主语导致检索命中率低的问题。
+    任何异常（调用失败 / 输出为空 / 长度异常）都降级返回用户原问题。
+    """
+    if not history:
+        return query
+    lines = ["你是一个查询重写助手。请结合历史对话，把用户的当前问题重写为一个不依赖上下文、独立完整的检索句子。只输出重写后的句子，不要任何解释。"]
+    lines.append("例如：历史“深蹲怎么做”，当前“对膝盖好吗”，重写为“深蹲对膝盖好吗”。")
+    lines.append("历史对话：")
+    for h in history[-4:]:
+        role = "用户" if h.get("role") == "user" else "助手"
+        lines.append(f"{role}：{(h.get('content') or '')[:150]}")
+    lines.append(f"当前问题：{query}")
+    try:
+        client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+        resp = client.chat.completions.create(
+            model=DEEPSEEK_MODEL,
+            messages=[{"role": "user", "content": "\n".join(lines)}],
+            temperature=0.0,
+            # deepseek-flash 是推理模型：思考也要消耗预算，给足（max_tokens=8 的教训）
+            max_tokens=512,
+        )
+        out = (resp.choices[0].message.content or "").strip()
+        # 输出消毒：去包裹引号/换行；长度异常视为失败，降级原问题
+        out = out.strip("“”‘’\"'「」").replace("\n", " ").strip()
+        if out and 2 <= len(out) <= 120:
+            return out
+    except Exception:
+        pass
+    return query
 
 
 def _build_messages(
@@ -316,13 +339,12 @@ def answer(query: str, top_k: int = TOP_K, history: list[dict] | None = None) ->
     - 正常：按 category 限定检索目录，相似度不足时追问而非硬答
 
     history：可选，最近几轮的对话（[{role, content}, ...]），用于多轮上下文。
-            检索基于「历史拼接 + 当前问题」的合并上下文；
-            分类只看当前问题（历史仅作 LLM 兜底分类参考），避免历史文本中的
-            "疼/伤/诊断"等字眼把正常问题连坐误判为 refuse。
+            有历史时先做 Query Rewrite：把追问重写为独立完整的检索句，
+            分类与检索均基于重写句（重写失败降级原问题）；回答生成仍面向原问题。
     """
     recent = history[-4:] if history else None
-    category = classify(query, history=recent)
-    merged = _merge_context(query, recent)
+    search_query = rewrite_query(query, recent)
+    category = classify(search_query, history=recent)
 
     # 1) 应拒答类：不检索、不生成建议
     if category == "refuse":
@@ -344,15 +366,15 @@ def answer(query: str, top_k: int = TOP_K, history: list[dict] | None = None) ->
             "clarify": True,
         }
 
-    # 3) 正常类：按类别目录限定检索（主领域 + 动态上传库）
+    # 3) 正常类：按类别目录限定检索（主领域 + 动态上传库），用重写后的独立句检索
     categories = _search_categories(category)
-    hits = retrieve(merged, top_k=top_k, categories=categories)
+    hits = retrieve(search_query, top_k=top_k, categories=categories)
 
     # 相似度不足 → 追问而非硬答。
     # 仅限「没有领域实体词」的问题：实体明确（蛋白质/深蹲/热身…）的问题
     # 即使相似度偏低也直接检索回答，绝不降级为 clarify
     if not hits or (
-        hits[0]["similarity"] < SIMILARITY_THRESHOLD and not has_domain_entity(query)
+        hits[0]["similarity"] < SIMILARITY_THRESHOLD and not has_domain_entity(search_query)
     ):
         return {
             "answer": CLARIFY_REPLY,
@@ -397,34 +419,36 @@ def answer_stream(
     refuse / clarify / 相似度不足时不调大模型：meta + 完整话术单块输出，前端表现一致。
     """
     recent = history[-4:] if history else None
-    category = classify(query, history=recent)
-    merged = _merge_context(query, recent)
+    search_query = rewrite_query(query, recent)
+    # 实际发生重写时才在 meta 里带上，供前端感知展示
+    rewritten = search_query if search_query != query else None
+    category = classify(search_query, history=recent)
 
     # 1) 拒答：meta + 完整话术，不调大模型
     if category == "refuse":
-        yield _sse({"meta": {"category": category, "refused": True, "clarify": False}})
+        yield _sse({"meta": {"category": category, "refused": True, "clarify": False, "rewritten": rewritten}})
         yield _sse({"text": REFUSE_REPLY})
         return
 
     # 2) 分类即模糊：追问，不检索不生成
     if category == "clarify":
-        yield _sse({"meta": {"category": category, "refused": False, "clarify": True}})
+        yield _sse({"meta": {"category": category, "refused": False, "clarify": True, "rewritten": rewritten}})
         yield _sse({"text": CLARIFY_REPLY})
         return
 
-    # 3) 正常类：检索（实体词豁免相似度阈值，与 answer() 一致）
+    # 3) 正常类：用重写后的独立句检索（实体词豁免相似度阈值，与 answer() 一致）
     categories = _search_categories(category)
-    hits = retrieve(merged, top_k=top_k, categories=categories)
+    hits = retrieve(search_query, top_k=top_k, categories=categories)
     low_sim = not hits or (
-        hits[0]["similarity"] < SIMILARITY_THRESHOLD and not has_domain_entity(query)
+        hits[0]["similarity"] < SIMILARITY_THRESHOLD and not has_domain_entity(search_query)
     )
     if low_sim:
-        yield _sse({"meta": {"category": category, "refused": False, "clarify": True}})
+        yield _sse({"meta": {"category": category, "refused": False, "clarify": True, "rewritten": rewritten}})
         yield _sse({"text": CLARIFY_REPLY})
         return
 
     # 4) 流式生成
-    yield _sse({"meta": {"category": category, "refused": False, "clarify": False}})
+    yield _sse({"meta": {"category": category, "refused": False, "clarify": False, "rewritten": rewritten}})
     messages = _build_messages(query, hits, history=recent)
     client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
     resp = client.chat.completions.create(

@@ -316,6 +316,20 @@ body {
 }
 .src-tag:hover { background: #e0ebff; border-color: #b9d2fa; }
 
+/* Query Rewrite 提示（气泡顶部浅灰小字） */
+.rewrite-hint {
+  font-size: 11.5px;
+  color: var(--text-3);
+  background: rgba(37, 99, 235, 0.05);
+  border-radius: 8px;
+  padding: 4px 9px;
+  margin-bottom: 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: help;
+}
+
 /* ===== 打字机光标（▌ 字符闪烁） ===== */
 .type-cursor {
   display: inline-block;
