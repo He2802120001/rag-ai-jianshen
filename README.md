@@ -115,6 +115,35 @@ Invoke-RestMethod -Uri http://127.0.0.1:8000/ask -Method Post `
   -ContentType "application/json; charset=utf-8" -Body $body
 ```
 
+## Docker 部署（本地一键测试 / 阿里云 2核2G）
+
+镜像只含代码与依赖（python:3.11-slim + CPU 版 torch）；`models/`、`data/`、`docs/uploads/` 与 `.env` 全部不进镜像，由 docker-compose 在运行时挂载/注入，重建容器不丢数据、不泄露密钥。
+
+```bash
+# 0) 首次准备：复制 .env.example 为 .env，填入真实 DEEPSEEK_API_KEY
+#    （models/ 与 data/ 已就位即可，无需改动）
+
+# 1) 一键构建并后台启动
+docker compose up -d --build
+
+# 2) 查看健康状态与日志（健康检查每 30s curl 一次 /health）
+docker compose ps
+docker compose logs -f
+
+# 3) 验证
+curl http://localhost:8000/health   # {"status":"ok"}
+
+# 停止 / 彻底移除容器（挂载的 models、data、docs/uploads 不受影响）
+docker compose down
+```
+
+服务器部署要点（阿里云 2核2G）：
+
+- 把项目目录（含 `models/`、`data/`、`.env`）同步到服务器后同样 `docker compose up -d --build`；镜像约 2~3GB，`pip install` 需拉取 CPU 版 torch，首次构建预留 10~20 分钟。
+- `restart: always` + `mem_limit: 1500m`：进程崩溃或超内存被杀都会自动拉起；日志轮转 10MB×3 防写满磁盘。
+- 记得在阿里云安全组放行 8000 端口（或仅放行 nginx 反代所在端口）。
+- 建议把 `ADMIN_TOKEN` 写进服务器上的 `.env` 换成强随机串，不要用默认值。
+
 ## 安全边界与分类
 
 系统对每个问题先做**意图分类**，再决定走哪条路径：

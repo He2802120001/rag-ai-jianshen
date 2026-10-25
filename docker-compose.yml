@@ -1,0 +1,35 @@
+# 一键启动：docker compose up -d --build
+# 前置：项目根目录放好 .env（参考 .env.example），models/ 与 data/ 已就位
+services:
+  fitness-qa:
+    build: .
+    image: fitness-qa-agent:latest
+    container_name: fitness-qa-agent
+    ports:
+      - "8000:8000"
+    # 注入 DEEPSEEK_API_KEY / ADMIN_TOKEN（.env 已被 .dockerignore 挡在镜像外，密钥不落镜像层）
+    env_file:
+      - .env
+    volumes:
+      # 模型与向量库走宿主机持久化：重建容器 / 升级镜像后，模型与检索索引不丢
+      - ./models:/app/models
+      - ./data:/app/data
+      # 管理后台上传的原始文档（向量本身已持久化在 ./data，这里保源文件，容器重建后仍可全量重建索引）
+      - ./docs/uploads:/app/docs/uploads
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # 首次启动要 import torch + 加载 bge 模型 + 打开 ChromaDB，慢机器上留足宽限期
+      start_period: 90s
+    # 2核2G 防整机 OOM：超限容器被杀后由 restart: always 自动拉起
+    # （模型加载峰值约 800MB，1500m 已留余量；本机测试内存充裕可删掉此行）
+    mem_limit: 1500m
+    # 访问日志不轮转会写满小服务器磁盘：单文件 10MB × 3 份
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
