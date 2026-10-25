@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import List, Optional
 
@@ -14,13 +15,45 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 from backend import rag
-from backend.config import ADMIN_TOKEN, DOCS_DIR, UPLOADS_DIR_NAME
+from backend.config import ADMIN_TOKEN, DEEPSEEK_API_KEY, DOCS_DIR, UPLOADS_DIR_NAME
 from backend.logger import get_logger
 
 # 全局业务日志：控制台 + logs/app.log 双写（10MB×3 轮转），格式「时间 - 级别 - 模块名 - 消息」
 logger = get_logger(__name__)
 
-app = FastAPI(title="Fitness QA Agent")
+APP_VERSION = "0.3.0"
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    """启动自检（护盾 3）：关键环境变量缺失 / 默认密码时打严重告警。
+
+    DEEPSEEK_API_KEY 缺失时 config 导入即抛 KeyError（fail-fast），
+    这里的兜底检查防止未来 config 改为宽松读取后退化成静默故障。
+    """
+    if not DEEPSEEK_API_KEY:
+        logger.critical("DEEPSEEK_API_KEY 未配置：LLM 问答与建库将不可用！")
+    if ADMIN_TOKEN == "fitness-admin":
+        logger.warning("WARNING: 正在使用默认管理员密码，请立即修改！")
+    yield
+
+
+app = FastAPI(title="Fitness QA Agent", version=APP_VERSION, lifespan=lifespan)
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    """安全响应头护盾（护盾 2）：全站注入，含静态文件与 SSE 流式响应。
+
+    - nosniff：禁止浏览器猜测 MIME 类型，防恶意上传被当脚本执行
+    - DENY：禁止被任何站点 iframe 嵌入，防点击劫持
+    - XSS-Protection：启用浏览器内建反射型 XSS 拦截（旧浏览器兜底）
+    """
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    return response
 
 # ---- 接口限流（SlowAPI，按客户端 IP 的内存固定窗口计数）----
 # 仅装饰 /ask 与 /ask_stream：静态页面、/health、管理接口均不受限
@@ -46,7 +79,10 @@ def rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded) -> JSO
 # 动态上传文档的落盘目录与限制
 UPLOADS_DIR = DOCS_DIR / UPLOADS_DIR_NAME
 ALLOWED_EXTENSIONS = (".md", ".txt")
-MAX_UPLOAD_CHARS = 200_000  # 约 200KB 文本上限，防止超大文件拖垮服务
+MAX_UPLOAD_BYTES = 500 * 1024  # 上传内容上限 500KB（按 UTF-8 字节计），防超大文件拖垮服务
+
+# 提问长度上限：超长问题直接 400，不进检索与 LLM 链路
+MAX_QUESTION_CHARS = 1000
 
 # 伪科学/违规推广类敏感词：命中即拒绝入库（数据投毒防护的第一道闸）
 SENSITIVE_WORDS = (
@@ -64,6 +100,13 @@ def _check_admin_token(x_admin_token: Optional[str]) -> None:
     """管理接口鉴权：请求头 X-Admin-Token 必须与配置一致。"""
     if x_admin_token != ADMIN_TOKEN:
         raise HTTPException(status_code=403, detail="无权限：Admin Token 缺失或不正确")
+
+
+def _check_question(question: str) -> None:
+    """OOM 护盾：超长提问直接 400 拦截，不进检索与 LLM 链路。"""
+    if len(question) > MAX_QUESTION_CHARS:
+        logger.warning("[ask] 拦截：问题超过 %d 字（实际 %d 字），已拒绝", MAX_QUESTION_CHARS, len(question))
+        raise HTTPException(status_code=400, detail="问题太长，请精简后提问")
 
 
 class AskRequest(BaseModel):
@@ -108,6 +151,7 @@ def _audit_log(fmt: str, *args) -> None:
 @app.post("/ask", response_model=AskResponse)
 @limiter.limit("10/minute")
 def ask(request: Request, req: AskRequest) -> dict:
+    _check_question(req.question)  # OOM 护盾：超长提问在审计与检索前拦截
     # 请求审计日志：记录原始 question 与 history 摘要，便于排查
     # 「前端到底传了什么」「分类结果是什么」类问题
     _audit_log("[ask] question=%r history=[%s]", req.question, _hist_summary(req.history))
@@ -130,6 +174,7 @@ def ask_stream(request: Request, req: AskRequest) -> StreamingResponse:
 
     保留 POST /ask 不变（非流式），供评估脚本继续使用。
     """
+    _check_question(req.question)  # OOM 护盾：超长提问在审计与检索前拦截
     _audit_log("[ask_stream] question=%r history=[%s]", req.question, _hist_summary(req.history))
     return StreamingResponse(
         rag.answer_stream(req.question, history=req.history or None),
@@ -149,8 +194,13 @@ def upload(
     name = Path(req.filename.replace("\\", "/")).name
     if not name.lower().endswith(ALLOWED_EXTENSIONS):
         raise HTTPException(status_code=400, detail="仅支持 .md 或 .txt 文件")
-    if len(req.content) > MAX_UPLOAD_CHARS:
-        raise HTTPException(status_code=400, detail="文件过大（超过 20 万字符上限）")
+    # OOM 护盾：按 UTF-8 字节计 500KB 上限，超限直接 413，不落盘不入库
+    content_bytes = len(req.content.encode("utf-8"))
+    if content_bytes > MAX_UPLOAD_BYTES:
+        logger.warning(
+            "[upload] 拒绝入库：内容超过 500KB 上限（%d 字节）filename=%r", content_bytes, name
+        )
+        raise HTTPException(status_code=413, detail="文件过大（超过 500KB 上限）")
 
     # 敏感词过滤（内容投毒防护）：命中即拒绝，不落盘不入库
     hit = next((w for w in SENSITIVE_WORDS if w in req.content or w in name), None)

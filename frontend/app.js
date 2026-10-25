@@ -43,6 +43,18 @@
     if (isNearBottom()) scrollToBottom();
   }
 
+  // 从非 200 响应体解析 FastAPI 标准报错 {"detail": "..."}（400 拦截 / 429 限流等），
+  // 后端给出的中文提示原样透传给用户；解析失败（非 JSON / 无 detail）回退通用提示
+  async function extractDetail(resp, fallback) {
+    try {
+      const data = await resp.json();
+      if (data && typeof data.detail === "string" && data.detail) return data.detail;
+    } catch (e) {
+      /* 响应体不是 JSON（如网关 HTML 错误页）：走回退提示 */
+    }
+    return fallback;
+  }
+
   // ---------- 轻量富文本渲染（防注入） ----------
   // 先转义全部 HTML，再把受控标记转成白名单标签，最后清理任何残留的非白名单标签
   function renderAnswer(text) {
@@ -430,7 +442,10 @@
         body: JSON.stringify({ question: text, history }),
         signal: currentController.signal,
       });
-      if (!resp.ok) throw new Error("服务错误 (" + resp.status + ")");
+      if (!resp.ok) {
+        // 透传后端 detail（如「问题太长，请精简后提问」「提问太频繁啦…」），而非干巴巴的状态码
+        throw new Error(await extractDetail(resp, "服务错误 (" + resp.status + ")"));
+      }
 
       const reader = resp.body.getReader();
       const decoder = new TextDecoder("utf-8");
