@@ -131,6 +131,34 @@
     return { wrap, body };
   }
 
+  // 构建 AI 回答气泡（拒绝/追问徽章 + 改写提示 + 正文容器）：
+  // renderHistory 与流式 meta 共用同一构建逻辑，杜绝两处实现漂移
+  function buildAnswerBubble(meta, timeStr) {
+    const m = makeMsg("assistant", timeStr);
+    const bubble = document.createElement("div");
+    bubble.className = "bubble";
+    if (meta.refused || meta.clarify) {
+      bubble.classList.add(meta.refused ? "is-refused" : "is-clarify", "has-flag");
+      const flag = document.createElement("span");
+      flag.className = "flag " + (meta.refused ? "flag-refused" : "flag-clarify");
+      flag.textContent = meta.refused ? "\u26A0\uFE0F 已拦截" : "\u2753 需要补充信息";
+      bubble.appendChild(flag);
+    }
+    if (meta.rewritten) {
+      const rw = document.createElement("div");
+      rw.className = "rewrite-hint";
+      rw.title = "多轮追问已自动重写为独立完整的检索句";
+      rw.textContent = "\uD83D\uDD0E 已结合上下文优化检索：" + meta.rewritten;
+      bubble.appendChild(rw);
+    }
+    const answerText = document.createElement("div");
+    answerText.className = "answer-text";
+    bubble.appendChild(answerText);
+    m.body.appendChild(bubble);
+    chat.appendChild(m.wrap);
+    return { bubble, answerText };
+  }
+
   function addWelcome() {
     const { wrap, body } = makeMsg("assistant");
     const bubble = document.createElement("div");
@@ -391,28 +419,19 @@
   function renderHistory() {
     chat.innerHTML = "";
     messages.forEach((m) => {
-      const { wrap, body } = makeMsg(m.role, m.t);
-      const bubble = document.createElement("div");
-      bubble.className = "bubble";
       if (m.role === "user") {
+        const { wrap, body } = makeMsg(m.role, m.t);
+        const bubble = document.createElement("div");
+        bubble.className = "bubble";
         bubble.textContent = m.content;
+        body.appendChild(bubble);
+        chat.appendChild(wrap);
       } else {
-        if (m.refused || m.clarify) {
-          bubble.classList.add(m.refused ? "is-refused" : "is-clarify", "has-flag");
-          const flag = document.createElement("span");
-          flag.className = "flag " + (m.refused ? "flag-refused" : "flag-clarify");
-          flag.textContent = m.refused ? "\u26A0\uFE0F 已拦截" : "\u2753 需要补充信息";
-          bubble.appendChild(flag);
-        }
-        const answerText = document.createElement("div");
-        answerText.className = "answer-text";
-        answerText.innerHTML = renderAnswer(m.content);
-        bubble.appendChild(answerText);
-        if (m.sources && m.sources.length) appendSources(bubble, m.sources);
-        appendActions(bubble, m.content);
+        const built = buildAnswerBubble({ refused: !!m.refused, clarify: !!m.clarify }, m.t);
+        built.answerText.innerHTML = renderAnswer(m.content);
+        if (m.sources && m.sources.length) appendSources(built.bubble, m.sources);
+        appendActions(built.bubble, m.content);
       }
-      body.appendChild(bubble);
-      chat.appendChild(wrap);
     });
     if (!messages.length) addWelcome();
     refreshRegenButtons();
@@ -491,18 +510,76 @@
   }
 
   // ---------- 流式问答 ----------
+  // 生成状态切换：输入框 / 发送按钮 / 重新生成按钮的可用性与文案统一管理
+  function setBusy(on) {
+    busy = on;
+    input.disabled = on;
+    sendBtn.classList.toggle("is-stop", on);
+    btnLabel.textContent = on ? "停止" : "发送";
+    sendBtn.setAttribute("aria-label", on ? "停止生成" : "发送");
+    chat.querySelectorAll(".act-regen").forEach((b) => (b.disabled = on));
+    if (!on) {
+      refreshRegenButtons(); // 空闲后把「重新生成」挂回最后一条 AI 回答
+      input.focus();
+    }
+  }
+
+  // 读取 SSE 流：按空行切分事件（一条事件内可含多个 data: 行），单条坏事件不中断整个流
+  async function consumeSseStream(reader, onEvent) {
+    const decoder = new TextDecoder("utf-8");
+    let sseBuf = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      sseBuf += decoder.decode(value, { stream: true });
+      let sep;
+      while ((sep = sseBuf.indexOf("\n\n")) >= 0) {
+        const rawEvent = sseBuf.slice(0, sep);
+        sseBuf = sseBuf.slice(sep + 2);
+        for (const line of rawEvent.split("\n")) {
+          if (!line.startsWith("data:")) continue;
+          try {
+            onEvent(JSON.parse(line.slice(5).trim()));
+          } catch (e) {
+            /* 单条坏事件不中断整个流 */
+          }
+        }
+      }
+    }
+  }
+
+  // 收尾 DOM：终帧渲染、来源标签、停止标记、操作区；
+  // 首事件未到即停止时补一个空气泡承载「已停止」提示（st.bubble 可变，占位气泡回写）
+  function finalizeAnswer(st) {
+    if (!st.bubble && st.stopped) {
+      st.typingWrap.remove();
+      const m = makeMsg("assistant");
+      st.bubble = document.createElement("div");
+      st.bubble.className = "bubble";
+      m.body.appendChild(st.bubble);
+      chat.appendChild(m.wrap);
+    }
+    if (st.bubble) {
+      st.finalRender(); // 终帧：完整渲染并移除光标
+      if (st.sources && st.sources.length) appendSources(st.bubble, st.sources);
+      if (st.stopped) {
+        const note = document.createElement("div");
+        note.className = "stopped-note";
+        note.textContent = "\u23F9 已停止生成";
+        st.bubble.appendChild(note);
+      }
+      appendActions(st.bubble, st.buf); // 底部操作区（复制；重新生成由 setBusy 收尾统一挂载）
+    } else if (!st.stopped && !st.errored) {
+      // 流正常结束却连 meta 都没收到（如服务端中途断流）
+      st.typingWrap.remove();
+      addError("未收到任何内容，连接可能中断，请重试");
+    }
+  }
+
   async function ask(text, opts) {
     const regen = !!(opts && opts.regen); // 重新生成：用户气泡已存在，不重复添加
-    busy = true;
+    setBusy(true);
     currentController = new AbortController();
-    input.disabled = true;
-    // 生成期间禁用所有「重新生成」按钮
-    chat.querySelectorAll(".act-regen").forEach((b) => (b.disabled = true));
-    // 发送按钮切换为「停止」
-    sendBtn.classList.add("is-stop");
-    sendBtn.classList.remove("is-loading");
-    btnLabel.textContent = "停止";
-    sendBtn.setAttribute("aria-label", "停止生成");
 
     if (!regen) {
       addUser(text);
@@ -547,28 +624,9 @@
       if (payload.meta) {
         meta = payload.meta;
         typingWrap.remove();
-        const m = makeMsg("assistant");
-        bubble = document.createElement("div");
-        bubble.className = "bubble";
-        if (meta.refused || meta.clarify) {
-          bubble.classList.add(meta.refused ? "is-refused" : "is-clarify", "has-flag");
-          const flag = document.createElement("span");
-          flag.className = "flag " + (meta.refused ? "flag-refused" : "flag-clarify");
-          flag.textContent = meta.refused ? "\u26A0\uFE0F 已拦截" : "\u2753 需要补充信息";
-          bubble.appendChild(flag);
-        }
-        if (meta.rewritten) {
-          const rw = document.createElement("div");
-          rw.className = "rewrite-hint";
-          rw.title = "多轮追问已自动重写为独立完整的检索句";
-          rw.textContent = "\uD83D\uDD0E 已结合上下文优化检索：" + meta.rewritten;
-          bubble.appendChild(rw);
-        }
-        answerText = document.createElement("div");
-        answerText.className = "answer-text";
-        bubble.appendChild(answerText);
-        m.body.appendChild(bubble);
-        chat.appendChild(m.wrap);
+        const built = buildAnswerBubble(meta);
+        bubble = built.bubble;
+        answerText = built.answerText;
         cursor = document.createElement("span");
         cursor.className = "type-cursor";
         cursor.textContent = "▌"; // 流式期间的闪烁光标字符
@@ -603,28 +661,7 @@
         throw new Error(await extractDetail(resp, "服务错误 (" + resp.status + ")"));
       }
 
-      const reader = resp.body.getReader();
-      const decoder = new TextDecoder("utf-8");
-      let sseBuf = "";
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        sseBuf += decoder.decode(value, { stream: true });
-        // SSE 事件以空行分隔；一条事件内可能有多个 data: 行
-        let sep;
-        while ((sep = sseBuf.indexOf("\n\n")) >= 0) {
-          const rawEvent = sseBuf.slice(0, sep);
-          sseBuf = sseBuf.slice(sep + 2);
-          for (const line of rawEvent.split("\n")) {
-            if (!line.startsWith("data:")) continue;
-            try {
-              onEvent(JSON.parse(line.slice(5).trim()));
-            } catch (e) {
-              /* 单条坏事件不中断整个流 */
-            }
-          }
-        }
-      }
+      await consumeSseStream(resp.body.getReader(), onEvent);
     } catch (err) {
       if (err && err.name === "AbortError") {
         if (timedOut) {
@@ -648,30 +685,15 @@
     }
 
     // ---------- 收尾 ----------
-    if (!bubble && stopped) {
-      // 首个事件还没到就点了停止：仍给一个气泡承载「已停止」提示
-      typingWrap.remove();
-      const m = makeMsg("assistant");
-      bubble = document.createElement("div");
-      bubble.className = "bubble";
-      m.body.appendChild(bubble);
-      chat.appendChild(m.wrap);
-    }
-    if (bubble) {
-      renderStreamed(true); // 终帧：完整渲染并移除光标
-      if (sources && sources.length) appendSources(bubble, sources);
-      if (stopped) {
-        const note = document.createElement("div");
-        note.className = "stopped-note";
-        note.textContent = "\u23F9 已停止生成";
-        bubble.appendChild(note);
-      }
-      appendActions(bubble, buf); // 底部操作区（复制；重新生成由下方统一挂载）
-    } else if (!stopped && !errored) {
-      // 流正常结束却连 meta 都没收到（如服务端中途断流）
-      typingWrap.remove();
-      addError("未收到任何内容，连接可能中断，请重试");
-    }
+    finalizeAnswer({
+      bubble,
+      sources,
+      stopped,
+      errored,
+      typingWrap,
+      buf,
+      finalRender: () => renderStreamed(true),
+    });
     // 记录助手回答（含被停止的部分内容），供后续轮次引用与会话恢复；
     // 额外保存 refused/clarify 标志与来源（text 截断防 localStorage 膨胀）
     if (buf) {
@@ -688,14 +710,8 @@
     }
     persistCurrent(); // 完成后同步 localStorage
 
-    busy = false;
-    refreshRegenButtons(); // 空闲后把「重新生成」挂回最后一条 AI 回答
+    setBusy(false);
     currentController = null;
-    input.disabled = false;
-    sendBtn.classList.remove("is-stop");
-    btnLabel.textContent = "发送";
-    sendBtn.setAttribute("aria-label", "发送");
-    input.focus();
   }
 
   function sendCurrent() {

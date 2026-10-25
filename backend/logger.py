@@ -6,8 +6,6 @@
   propagate 关闭，避免向 uvicorn 根 logger 冒泡造成控制台双份输出
 """
 
-from __future__ import annotations
-
 import logging
 import sys
 from logging.handlers import RotatingFileHandler

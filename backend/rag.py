@@ -3,8 +3,6 @@
 只实现单一 RAG 链路，不做意图分类 / 安全拒答 / 追问 / 前端 / 评估。
 """
 
-from __future__ import annotations
-
 import json
 from pathlib import Path
 from typing import Iterator
@@ -276,7 +274,7 @@ def _get_bm25() -> dict:
     return _BM25_STATE
 
 
-def retrieve(query: str, top_k: int = TOP_K, categories: list[str] | None = None) -> list[dict]:
+def retrieve(query: str, categories: list[str] | None = None) -> list[dict]:
     """混合检索：向量 Top10 + BM25 Top10 → RRF 融合取 Top-K。
 
     返回 [{text, source, category, distance, similarity, rrf, vec_rank, bm25_rank}]。
@@ -291,7 +289,7 @@ def retrieve(query: str, top_k: int = TOP_K, categories: list[str] | None = None
     collection = _get_collection()
     q_emb = _embed([q])[0]
     where = {"category": {"$in": list(categories)}} if categories else None
-    fetch = max(HYBRID_FETCH, top_k)
+    fetch = HYBRID_FETCH
 
     # ---- A) 向量通道：ChromaDB 取 Top fetch（query 结果默认携带 ids）----
     result = collection.query(
@@ -341,7 +339,7 @@ def retrieve(query: str, top_k: int = TOP_K, categories: list[str] | None = None
 
     # ---- 降级：BM25 不可用时直接返回纯向量结果 ----
     if not bm_order:
-        hits = [dict(vec_hits[cid]) for cid in vec_order[:top_k]]
+        hits = [dict(vec_hits[cid]) for cid in vec_order[:TOP_K]]
         for h in hits:
             h.setdefault("rrf", None)
             h.setdefault("vec_rank", None)
@@ -353,7 +351,7 @@ def retrieve(query: str, top_k: int = TOP_K, categories: list[str] | None = None
     for rank_list in (vec_order, bm_order):
         for rank, cid in enumerate(rank_list, start=1):
             fused[cid] = fused.get(cid, 0.0) + 1.0 / (RRF_K + rank)
-    top_ids = sorted(fused, key=fused.get, reverse=True)[:top_k]
+    top_ids = sorted(fused, key=fused.get, reverse=True)[:TOP_K]
 
     hits = []
     for cid in top_ids:
@@ -446,61 +444,66 @@ def _build_messages(
     ]
 
 
-def answer(query: str, top_k: int = TOP_K, history: list[dict] | None = None) -> dict:
-    """RAG 问答入口：先分类，再按类别决定 refuse / clarify / 正常检索生成。
+def _plan(query: str, recent: list[dict] | None) -> dict:
+    """问答决策：answer() 与 answer_stream() 的唯一决策来源。
 
-    返回 {"answer", "sources", "category", "refused", "clarify"}。
-    - refused=True：拒绝回答（伤病/医疗，固定话术，不检索）
-    - clarify=True：追问澄清（信息不足，不检索）
-    - 正常：按 category 限定检索目录，相似度不足时追问而非硬答
+    把原先两个入口各自复制的决策链收敛到这里，安全规则改动只需改一处，
+    杜绝 /ask 与 /ask_stream 行为分叉的风险。链路：
+    Query Rewrite → 意图分类 → refuse/clarify 短路 → 按类别检索 → 相似度兜底。
 
-    history：可选，最近几轮的对话（[{role, content}, ...]），用于多轮上下文。
-            有历史时先做 Query Rewrite：把追问重写为独立完整的检索句，
-            分类与检索均基于重写句（重写失败降级原问题）；回答生成仍面向原问题。
+    返回 {"category", "refused", "clarify", "hits", "rewritten"}：
+    - refused / clarify 为 True 时 hits 为空，调用方输出固定话术、不检索不生成；
+    - rewritten：实际发生重写时的重写句（未重写为 None），供流式 meta 感知展示；
+    - 一切正常时 hits 为混合检索结果，调用方基于其生成回答（面向原始问题）。
     """
-    recent = history[-4:] if history else None
     search_query = rewrite_query(query, recent)
+    rewritten = search_query if search_query != query else None
     category = classify(search_query, history=recent)
 
     # 1) 应拒答类：不检索、不生成建议
     if category == "refuse":
-        return {
-            "answer": REFUSE_REPLY,
-            "sources": [],
-            "category": category,
-            "refused": True,
-            "clarify": False,
-        }
+        return {"category": category, "refused": True, "clarify": False, "hits": [], "rewritten": rewritten}
 
-    # 2) 模糊问题：追问澄清
+    # 2) 分类即模糊：追问澄清
     if category == "clarify":
-        return {
-            "answer": CLARIFY_REPLY,
-            "sources": [],
-            "category": category,
-            "refused": False,
-            "clarify": True,
-        }
+        return {"category": category, "refused": False, "clarify": True, "hits": [], "rewritten": rewritten}
 
     # 3) 正常类：按类别目录限定检索（主领域 + 动态上传库），用重写后的独立句检索
-    categories = _search_categories(category)
-    hits = retrieve(search_query, top_k=top_k, categories=categories)
+    hits = retrieve(search_query, categories=_search_categories(category))
 
-    # 相似度不足 → 追问而非硬答。
-    # 仅限「没有领域实体词」的问题：实体明确（蛋白质/深蹲/热身…）的问题
-    # 即使相似度偏低也直接检索回答，绝不降级为 clarify
+    # 相似度不足 → 追问而非硬答。仅限「没有领域实体词」的问题：
+    # 实体明确（蛋白质/深蹲/热身…）的问题即使相似度偏低也直接检索回答，绝不降级为 clarify
     if not hits or (
         hits[0]["similarity"] < SIMILARITY_THRESHOLD and not has_domain_entity(search_query)
     ):
+        return {"category": category, "refused": False, "clarify": True, "hits": [], "rewritten": rewritten}
+
+    return {"category": category, "refused": False, "clarify": False, "hits": hits, "rewritten": rewritten}
+
+
+def answer(query: str, history: list[dict] | None = None) -> dict:
+    """RAG 问答入口（非流式）：决策统一走 _plan，本函数只负责组装 JSON 返回。
+
+    返回 {"answer", "sources", "category", "refused", "clarify"}：
+    - refused=True：拒绝回答（伤病/医疗，固定话术，不检索）
+    - clarify=True：追问澄清（信息不足，不检索）
+    - 正常：基于检索结果生成回答（检索用重写句，回答面向原始问题）
+
+    history：可选，最近几轮的对话（[{role, content}, ...]），用于多轮上下文。
+    """
+    recent = history[-4:] if history else None
+    plan = _plan(query, recent)
+
+    if plan["refused"] or plan["clarify"]:
         return {
-            "answer": CLARIFY_REPLY,
+            "answer": REFUSE_REPLY if plan["refused"] else CLARIFY_REPLY,
             "sources": [],
-            "category": category,
-            "refused": False,
-            "clarify": True,
+            "category": plan["category"],
+            "refused": plan["refused"],
+            "clarify": plan["clarify"],
         }
 
-    messages = _build_messages(query, hits, history=recent)
+    messages = _build_messages(query, plan["hits"], history=recent)
     client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL, timeout=60)
     resp = client.chat.completions.create(
         model=DEEPSEEK_MODEL,
@@ -510,8 +513,8 @@ def answer(query: str, top_k: int = TOP_K, history: list[dict] | None = None) ->
     answer_text = resp.choices[0].message.content or ""
     return {
         "answer": answer_text,
-        "sources": [{"text": h["text"], "source": h["source"]} for h in hits],
-        "category": category,
+        "sources": [{"text": h["text"], "source": h["source"]} for h in plan["hits"]],
+        "category": plan["category"],
         "refused": False,
         "clarify": False,
     }
@@ -523,49 +526,35 @@ def _sse(payload: dict) -> str:
 
 
 def answer_stream(
-    query: str, top_k: int = TOP_K, history: list[dict] | None = None
+    query: str, history: list[dict] | None = None
 ) -> Iterator[str]:
-    """流式问答入口：yield SSE 事件字符串，与 answer() 共享同一套分类与检索逻辑。
+    """流式问答入口（SSE）：决策统一走 _plan，本函数只负责 SSE 事件输出。
 
     事件协议：
-      data: {"meta": {"category":…, "refused":…, "clarify":…}}   首个事件，前端渲染徽章
+      data: {"meta": {"category":…, "refused":…, "clarify":…, "rewritten":…}}  首个事件，前端渲染徽章
       data: {"text": "…"}                                        文本块（0..n 次）
       data: {"sources": [{text, source}, …]}                     收尾事件（仅正常回答）
 
     refuse / clarify / 相似度不足时不调大模型：meta + 完整话术单块输出，前端表现一致。
     """
     recent = history[-4:] if history else None
-    search_query = rewrite_query(query, recent)
-    # 实际发生重写时才在 meta 里带上，供前端感知展示
-    rewritten = search_query if search_query != query else None
-    category = classify(search_query, history=recent)
+    plan = _plan(query, recent)
+    meta = {
+        "category": plan["category"],
+        "refused": plan["refused"],
+        "clarify": plan["clarify"],
+        "rewritten": plan["rewritten"],
+    }
 
-    # 1) 拒答：meta + 完整话术，不调大模型
-    if category == "refuse":
-        yield _sse({"meta": {"category": category, "refused": True, "clarify": False, "rewritten": rewritten}})
-        yield _sse({"text": REFUSE_REPLY})
+    # 1) 拒答 / 追问：meta + 完整话术，不检索不调大模型
+    if plan["refused"] or plan["clarify"]:
+        yield _sse({"meta": meta})
+        yield _sse({"text": REFUSE_REPLY if plan["refused"] else CLARIFY_REPLY})
         return
 
-    # 2) 分类即模糊：追问，不检索不生成
-    if category == "clarify":
-        yield _sse({"meta": {"category": category, "refused": False, "clarify": True, "rewritten": rewritten}})
-        yield _sse({"text": CLARIFY_REPLY})
-        return
-
-    # 3) 正常类：用重写后的独立句检索（实体词豁免相似度阈值，与 answer() 一致）
-    categories = _search_categories(category)
-    hits = retrieve(search_query, top_k=top_k, categories=categories)
-    low_sim = not hits or (
-        hits[0]["similarity"] < SIMILARITY_THRESHOLD and not has_domain_entity(search_query)
-    )
-    if low_sim:
-        yield _sse({"meta": {"category": category, "refused": False, "clarify": True, "rewritten": rewritten}})
-        yield _sse({"text": CLARIFY_REPLY})
-        return
-
-    # 4) 流式生成
-    yield _sse({"meta": {"category": category, "refused": False, "clarify": False, "rewritten": rewritten}})
-    messages = _build_messages(query, hits, history=recent)
+    # 2) 流式生成
+    yield _sse({"meta": meta})
+    messages = _build_messages(query, plan["hits"], history=recent)
     client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL, timeout=60)
     resp = client.chat.completions.create(
         model=DEEPSEEK_MODEL,
@@ -582,14 +571,8 @@ def answer_stream(
     yield _sse(
         {
             "sources": [
-                {
-                    "text": h["text"],
-                    "source": h["source"],
-                    "rrf": h.get("rrf"),
-                    "vec_rank": h.get("vec_rank"),
-                    "bm25_rank": h.get("bm25_rank"),
-                }
-                for h in hits
+                {"text": h["text"], "source": h["source"]}
+                for h in plan["hits"]
             ]
         }
     )

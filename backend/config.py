@@ -8,7 +8,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # ---- 管理后台（动态知识库）----
 # 上传/查库接口的鉴权令牌；生产环境务必通过环境变量覆盖默认值
-ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "fitness-admin")
+# 默认值单独导出常量，供启动自检比对「是否仍在使用默认密码」
+DEFAULT_ADMIN_TOKEN = "fitness-admin"
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", DEFAULT_ADMIN_TOKEN)
 
 # 动态上传文档的存放目录（相对 docs/），目录名即 ChromaDB category
 UPLOADS_DIR_NAME = "uploads"

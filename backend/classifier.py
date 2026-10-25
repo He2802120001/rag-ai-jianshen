@@ -10,8 +10,6 @@
    规则判断不出来时宁可放行去检索，也不在常识性动作问题上误拦。
 """
 
-from __future__ import annotations
-
 import re
 
 from openai import OpenAI

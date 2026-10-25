@@ -1,7 +1,5 @@
 """FastAPI 入口：暴露 POST /ask 与 GET /health，仅调用核心 RAG 链路。"""
 
-from __future__ import annotations
-
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import List, Optional
@@ -15,7 +13,14 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 from backend import rag
-from backend.config import ADMIN_TOKEN, DEEPSEEK_API_KEY, DOCS_DIR, UPLOADS_DIR_NAME
+from backend.config import (
+    ADMIN_TOKEN,
+    DEFAULT_ADMIN_TOKEN,
+    DEEPSEEK_API_KEY,
+    DOCS_DIR,
+    PROJECT_ROOT,
+    UPLOADS_DIR_NAME,
+)
 from backend.logger import get_logger
 
 # 全局业务日志：控制台 + logs/app.log 双写（10MB×3 轮转），格式「时间 - 级别 - 模块名 - 消息」
@@ -33,7 +38,7 @@ async def lifespan(_: FastAPI):
     """
     if not DEEPSEEK_API_KEY:
         logger.critical("DEEPSEEK_API_KEY 未配置：LLM 问答与建库将不可用！")
-    if ADMIN_TOKEN == "fitness-admin":
+    if ADMIN_TOKEN == DEFAULT_ADMIN_TOKEN:
         logger.warning("WARNING: 正在使用默认管理员密码，请立即修改！")
     yield
 
@@ -227,7 +232,6 @@ def documents(x_admin_token: Optional[str] = Header(default=None)) -> dict:
 
 
 # 静态文件挂载必须放在所有 API 路由之后，否则 /ask、/health 会被静态路由拦截
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
 app.mount(
     "/",
     StaticFiles(directory=str(PROJECT_ROOT / "frontend"), html=True),
