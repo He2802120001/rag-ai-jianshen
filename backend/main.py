@@ -2,22 +2,46 @@
 
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 from backend import rag
 from backend.config import ADMIN_TOKEN, DOCS_DIR, UPLOADS_DIR_NAME
+from backend.logger import get_logger
 
-# 挂到 uvicorn 的日志配置上，输出会进入 uvicorn_stderr.log
-logger = logging.getLogger("uvicorn.error")
+# 全局业务日志：控制台 + logs/app.log 双写（10MB×3 轮转），格式「时间 - 级别 - 模块名 - 消息」
+logger = get_logger(__name__)
 
 app = FastAPI(title="Fitness QA Agent")
+
+# ---- 接口限流（SlowAPI，按客户端 IP 的内存固定窗口计数）----
+# 仅装饰 /ask 与 /ask_stream：静态页面、/health、管理接口均不受限
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+
+
+@app.exception_handler(RateLimitExceeded)
+def rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
+    """触发限流：429 + 友好中文提示（detail 可被前端直接展示）。"""
+    logger.warning(
+        "[rate-limit] IP=%s path=%s 触发限流（%s）",
+        get_remote_address(request),
+        request.url.path,
+        exc.detail,
+    )
+    return JSONResponse(
+        status_code=429,
+        headers={"Retry-After": str(getattr(exc, "retry_after", "60"))},
+        content={"detail": "提问太频繁啦，休息一分钟再来吧～"},
+    )
 
 # 动态上传文档的落盘目录与限制
 UPLOADS_DIR = DOCS_DIR / UPLOADS_DIR_NAME
@@ -77,12 +101,13 @@ def _audit_log(fmt: str, *args) -> None:
     确保审计在任何情况下（格式化异常/编码问题等）都不影响 /ask 主链路。"""
     try:
         logger.info(fmt, *args)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("发生降级：审计日志写入失败: %s", e)
 
 
 @app.post("/ask", response_model=AskResponse)
-def ask(req: AskRequest) -> dict:
+@limiter.limit("10/minute")
+def ask(request: Request, req: AskRequest) -> dict:
     # 请求审计日志：记录原始 question 与 history 摘要，便于排查
     # 「前端到底传了什么」「分类结果是什么」类问题
     _audit_log("[ask] question=%r history=[%s]", req.question, _hist_summary(req.history))
@@ -99,7 +124,8 @@ def ask(req: AskRequest) -> dict:
 
 
 @app.post("/ask_stream")
-def ask_stream(req: AskRequest) -> StreamingResponse:
+@limiter.limit("10/minute")
+def ask_stream(request: Request, req: AskRequest) -> StreamingResponse:
     """流式问答：SSE 事件流。事件协议见 rag.answer_stream 文档字符串。
 
     保留 POST /ask 不变（非流式），供评估脚本继续使用。

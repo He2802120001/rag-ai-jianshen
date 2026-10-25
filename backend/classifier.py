@@ -17,6 +17,9 @@ import re
 from openai import OpenAI
 
 from backend.config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL
+from backend.logger import get_logger
+
+logger = get_logger(__name__)
 
 # 五类标签（与 ChromaDB metadata 的 category 对齐）
 CATEGORIES = ("technique", "nutrition", "injury-prevention", "refuse", "clarify")
@@ -173,8 +176,9 @@ def _llm_classify(question: str, history: list[dict] | None = None) -> str:
         for cat in CATEGORIES:
             if cat in label:
                 return cat
-    except Exception:
-        pass
+        logger.warning("发生降级：LLM 分类输出无法解析（%.60r），回退关键词规则", label)
+    except Exception as e:
+        logger.warning("发生降级：LLM 意图分类失败（超时/调用异常），回退关键词规则: %s", e)
     return ""
 
 

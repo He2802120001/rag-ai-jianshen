@@ -26,6 +26,7 @@ data/
 
 # ---- 日志 / 前端构建产物 / 系统杂项 ----
 *.log
+logs/
 node_modules/
 dist/
 .DS_Store

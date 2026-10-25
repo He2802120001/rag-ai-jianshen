@@ -28,6 +28,9 @@ from backend.config import (
     TOP_K,
     UPLOADS_DIR_NAME,
 )
+from backend.logger import get_logger
+
+logger = get_logger(__name__)
 
 # 动态上传文档的 category（检索时始终与主领域一起参与）
 UPLOAD_CATEGORY = UPLOADS_DIR_NAME
@@ -162,8 +165,8 @@ def build_index() -> dict:
     # 先删后建，保证重复调用不产生重复向量
     try:
         client.delete_collection(COLLECTION_NAME)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("发生降级：删除旧集合失败（首次建库时属预期），继续重建: %s", e)
     collection = client.create_collection(
         name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
     )
@@ -197,8 +200,8 @@ def add_document(md_path: Path, category: str = UPLOAD_CATEGORY) -> dict:
     collection = _get_collection()
     try:
         collection.delete(where={"source": source})
-    except Exception:
-        pass  # 首次上传时无旧块可删
+    except Exception as e:
+        logger.warning("发生降级：删除同源旧块失败（首次上传时属预期），按新增写入: %s", e)
     ids = [f"{category}:{md_path.stem}:{idx}" for idx in range(len(chunks))]
     metadatas = [{"source": source, "category": category}] * len(chunks)
     embeddings = _embed(chunks)
@@ -332,7 +335,8 @@ def retrieve(query: str, top_k: int = TOP_K, categories: list[str] | None = None
             if allowed is not None and chunk["category"] not in allowed:
                 continue
             bm_order.append(chunk["id"])
-    except Exception:
+    except Exception as e:
+        logger.warning("发生降级：BM25 通道不可用，本轮降级为纯向量检索: %s", e)
         bm = None
 
     # ---- 降级：BM25 不可用时直接返回纯向量结果 ----
@@ -406,8 +410,10 @@ def rewrite_query(query: str, history: list[dict] | None) -> str:
         out = out.strip("“”‘’\"'「」").replace("\n", " ").strip()
         if out and 2 <= len(out) <= 120:
             return out
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("发生降级：Query Rewrite 调用失败，使用原始问题检索: %s", e)
+    else:
+        logger.warning("发生降级：Query Rewrite 输出无效（%.60r），使用原始问题检索", out)
     return query
 
 

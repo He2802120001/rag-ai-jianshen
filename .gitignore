@@ -36,5 +36,6 @@ dist/
 
 # 日志
 *.log
+logs/
 uvicorn_stdout.log
 uvicorn_stderr.log
