@@ -61,7 +61,9 @@ async def security_headers(request: Request, call_next):
     return response
 
 # ---- 接口限流（SlowAPI，按客户端 IP 的内存固定窗口计数）----
-# 仅装饰 /ask 与 /ask_stream：静态页面、/health、管理接口均不受限
+# 仅装饰 /ask 与 /ask_stream：静态页面、/health、管理接口均不受限；
+# 两接口各自独立计数（评估脚本跑 /ask 不挤占真实聊天的 /ask_stream 额度）
+RATE_LIMIT = "10/minute"
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 
@@ -154,8 +156,22 @@ def _audit_log(fmt: str, *args) -> None:
 
 
 @app.post("/ask", response_model=AskResponse)
-@limiter.limit("10/minute")
+@limiter.limit(RATE_LIMIT)
 def ask(request: Request, req: AskRequest) -> dict:
+    """非流式问答：一次请求返回完整答案（评估脚本与程序化调用的入口）。
+
+    Args:
+        request: FastAPI 请求对象（限流组件依赖，调用方无需关心）。
+        req: ``{"question": str, "history": [{role, content}, ...]}``，
+            question 不超过 1000 字；history 可选，取最近几轮对话。
+
+    Returns:
+        ``{answer, sources, category, refused, clarify}``；refuse / clarify 时
+        不检索不生成，answer 为固定话术且 sources 为空。
+
+    Raises:
+        HTTPException: 400 问题超过 1000 字；429 触发限流（每分钟每 IP 10 次）。
+    """
     _check_question(req.question)  # OOM 护盾：超长提问在审计与检索前拦截
     # 请求审计日志：记录原始 question 与 history 摘要，便于排查
     # 「前端到底传了什么」「分类结果是什么」类问题
@@ -173,11 +189,26 @@ def ask(request: Request, req: AskRequest) -> dict:
 
 
 @app.post("/ask_stream")
-@limiter.limit("10/minute")
+@limiter.limit(RATE_LIMIT)
 def ask_stream(request: Request, req: AskRequest) -> StreamingResponse:
-    """流式问答：SSE 事件流。事件协议见 rag.answer_stream 文档字符串。
+    """流式问答：SSE 事件流（前端聊天主入口）。
 
-    保留 POST /ask 不变（非流式），供评估脚本继续使用。
+    事件协议（与 rag.answer_stream 一致）::
+
+        data: {"meta": {category, refused, clarify, rewritten}}   首事件，渲染徽章
+        data: {"text": "…"}                                       文本块（0..n 次）
+        data: {"sources": [{text, source}, …]}                    收尾（仅正常回答）
+
+    Args:
+        request: FastAPI 请求对象（限流组件依赖，调用方无需关心）。
+        req: 同 /ask 的请求体。
+
+    Returns:
+        ``text/event-stream`` 流式响应；refuse / clarify 时不调大模型，
+        meta + 完整话术单块输出。
+
+    Raises:
+        HTTPException: 400 问题超过 1000 字；429 触发限流（与 /ask 独立计数）。
     """
     _check_question(req.question)  # OOM 护盾：超长提问在审计与检索前拦截
     _audit_log("[ask_stream] question=%r history=[%s]", req.question, _hist_summary(req.history))
@@ -192,7 +223,20 @@ def ask_stream(request: Request, req: AskRequest) -> StreamingResponse:
 def upload(
     req: UploadRequest, x_admin_token: Optional[str] = Header(default=None)
 ) -> dict:
-    """动态知识库：上传新文档（JSON：filename + content），鉴权 + 敏感词过滤后增量入库。"""
+    """动态知识库：上传新文档，鉴权与安全过滤通过后增量入库，即时参与检索。
+
+    Args:
+        req: ``{"filename": str, "content": str}``，仅支持 .md / .txt，
+            content 按 UTF-8 计不超过 500KB。
+        x_admin_token: 请求头 ``X-Admin-Token``，须与管理员令牌一致。
+
+    Returns:
+        ``{ok, source, added}``，added 为切分后入库的块数（0 表示无有效内容）。
+
+    Raises:
+        HTTPException: 403 令牌缺失或不正确；400 扩展名不符 / 命中伪科学敏感词；
+        413 内容超过 500KB 上限。
+    """
     _check_admin_token(x_admin_token)
 
     # 文件名安全处理：仅取文件名部分（防路径穿越），校验扩展名
@@ -226,7 +270,17 @@ def upload(
 
 @app.get("/documents")
 def documents(x_admin_token: Optional[str] = Header(default=None)) -> dict:
-    """列出知识库当前所有不重复的文档来源名（需管理员鉴权）。"""
+    """列出知识库当前所有不重复的文档来源名（管理后台文档列表数据源）。
+
+    Args:
+        x_admin_token: 请求头 ``X-Admin-Token``，须与管理员令牌一致。
+
+    Returns:
+        ``{"documents": [source, ...]}``，source 为相对项目根的文档路径，字典序。
+
+    Raises:
+        HTTPException: 403 令牌缺失或不正确。
+    """
     _check_admin_token(x_admin_token)
     return {"documents": rag.list_sources()}
 

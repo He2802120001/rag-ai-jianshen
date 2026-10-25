@@ -15,6 +15,14 @@
   let currentSessionId = null;
   const SESSIONS_KEY = "fitness_qa_sessions";
 
+  // ---- 交互参数（原散落各处的魔法数字，集中管理）----
+  const FOLLOW_THRESHOLD_PX = 150;       // 距底部小于该值视为「在底部」，超出则暂停流式自动跟随
+  const WATCHDOG_FIRST_EVENT_MS = 45000; // 首事件看门狗：超时中止请求（LLM 挂起 / 网络黑洞）
+  const RENDER_THROTTLE_MS = 30;         // 流式渲染节流：30ms 一帧，更快人眼也无法分辨
+  const HISTORY_MESSAGES_MAX = 6;        // 每次请求携带的历史消息上限（约 3 轮）
+  const SOURCE_SNIPPET_CHARS = 120;      // localStorage 中来源文本截断长度，防存储膨胀
+  const INPUT_MAX_HEIGHT = 140;          // 输入框自适应高度上限（px），与 style.css 的 max-height 保持一致
+
   // ---------- 头像 SVG ----------
   const USER_AVATAR_SVG =
     '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-6 8-6s8 2 8 6"/></svg>';
@@ -42,7 +50,7 @@
     else if (isNearBottom()) autoFollow = true;
   });
   function isNearBottom() {
-    return chat.scrollHeight - chat.scrollTop - chat.clientHeight < 150;
+    return chat.scrollHeight - chat.scrollTop - chat.clientHeight < FOLLOW_THRESHOLD_PX;
   }
   function scrollToBottom() {
     autoFollow = true; // 主动滚动（新消息）无条件回到跟随态
@@ -315,16 +323,16 @@
   // 重新生成：取该回答对应的最近一次用户提问，作废其后所有回答，重发流式请求
   function regenerateAnswer() {
     if (busy) return;
-    let qi = -1;
+    let lastUserIndex = -1;
     for (let i = messages.length - 1; i >= 0; i--) {
       if (messages[i].role === "user") {
-        qi = i;
+        lastUserIndex = i;
         break;
       }
     }
-    if (qi < 0) return;
-    const question = messages[qi].content;
-    messages.length = qi + 1; // 丢弃该提问之后的所有消息（通常是 1 条 AI 回答）
+    if (lastUserIndex < 0) return;
+    const question = messages[lastUserIndex].content;
+    messages.length = lastUserIndex + 1; // 丢弃该提问之后的所有消息（通常是 1 条 AI 回答）
     renderHistory(); // DOM 与 messages 严格对齐（顺带清掉旧气泡/错误气泡）
     ask(question, { regen: true });
   }
@@ -550,28 +558,28 @@
 
   // 收尾 DOM：终帧渲染、来源标签、停止标记、操作区；
   // 首事件未到即停止时补一个空气泡承载「已停止」提示（st.bubble 可变，占位气泡回写）
-  function finalizeAnswer(st) {
-    if (!st.bubble && st.stopped) {
-      st.typingWrap.remove();
+  function finalizeAnswer(state) {
+    if (!state.bubble && state.stopped) {
+      state.typingWrap.remove();
       const m = makeMsg("assistant");
-      st.bubble = document.createElement("div");
-      st.bubble.className = "bubble";
-      m.body.appendChild(st.bubble);
+      state.bubble = document.createElement("div");
+      state.bubble.className = "bubble";
+      m.body.appendChild(state.bubble);
       chat.appendChild(m.wrap);
     }
-    if (st.bubble) {
-      st.finalRender(); // 终帧：完整渲染并移除光标
-      if (st.sources && st.sources.length) appendSources(st.bubble, st.sources);
-      if (st.stopped) {
+    if (state.bubble) {
+      state.finalRender(); // 终帧：完整渲染并移除光标
+      if (state.sources && state.sources.length) appendSources(state.bubble, state.sources);
+      if (state.stopped) {
         const note = document.createElement("div");
         note.className = "stopped-note";
         note.textContent = "\u23F9 已停止生成";
-        st.bubble.appendChild(note);
+        state.bubble.appendChild(note);
       }
-      appendActions(st.bubble, st.buf); // 底部操作区（复制；重新生成由 setBusy 收尾统一挂载）
-    } else if (!st.stopped && !st.errored) {
+      appendActions(state.bubble, state.buf); // 底部操作区（复制；重新生成由 setBusy 收尾统一挂载）
+    } else if (!state.stopped && !state.errored) {
       // 流正常结束却连 meta 都没收到（如服务端中途断流）
-      st.typingWrap.remove();
+      state.typingWrap.remove();
       addError("未收到任何内容，连接可能中断，请重试");
     }
   }
@@ -586,10 +594,10 @@
       persistCurrent(); // 用户消息实时入 localStorage
     }
     const typingWrap = addTyping();
-    // 携带最近 3 轮历史（最多 6 条），排除刚加入的当前问题（它在 question 字段里）
+    // 携带最近几轮历史，排除刚加入的当前问题（它在 question 字段里）
     const history = messages
       .slice(0, -1)
-      .slice(-6)
+      .slice(-HISTORY_MESSAGES_MAX)
       .map((m) => ({ role: m.role, content: m.content }));
 
     let meta = null;        // 首个事件：分类与标志位
@@ -608,7 +616,7 @@
     function renderStreamed(force) {
       if (!answerText) return;
       const now = Date.now();
-      if (!force && now - lastRender < 30) return;
+      if (!force && now - lastRender < RENDER_THROTTLE_MS) return;
       lastRender = now;
       answerText.innerHTML = renderAnswer(buf);
       if (!force && cursor) answerText.appendChild(cursor);
@@ -649,7 +657,7 @@
       watchdog = setTimeout(() => {
         timedOut = true;
         if (currentController) currentController.abort();
-      }, 45000);
+      }, WATCHDOG_FIRST_EVENT_MS);
       const resp = await fetch("/ask_stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -704,7 +712,7 @@
         refused: !!(meta && meta.refused),
         clarify: !!(meta && meta.clarify),
         sources: sources && sources.length
-          ? sources.map((s) => ({ source: s.source, text: String(s.text || "").slice(0, 120) }))
+          ? sources.map((s) => ({ source: s.source, text: String(s.text || "").slice(0, SOURCE_SNIPPET_CHARS) }))
           : undefined,
       });
     }
@@ -725,7 +733,7 @@
   // textarea 自适应高度
   function autoGrow() {
     input.style.height = "auto";
-    input.style.height = Math.min(input.scrollHeight, 140) + "px";
+    input.style.height = Math.min(input.scrollHeight, INPUT_MAX_HEIGHT) + "px";
   }
   input.addEventListener("input", autoGrow);
 

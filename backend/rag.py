@@ -37,6 +37,22 @@ UPLOAD_CATEGORY = UPLOADS_DIR_NAME
 # ChromaDB cosine 距离(d) ∈ [0,2]，相似度取 1-d；阈值 0.5 对应 d <= 0.5
 SIMILARITY_THRESHOLD = 0.5
 
+# ---- LLM（DeepSeek）调用参数：调过参的行为开关，集中管理，改一处全局生效 ----
+# 60s：覆盖推理模型「先思考后正文」的完整耗时；调短会静默截断思考导致正文为空
+LLM_TIMEOUT_SECONDS = 60
+# 只带最近 4 条消息（约 2 轮）进多轮上下文：更多历史会稀释相关性并拖慢重写/分类
+HISTORY_TURNS = 4
+# 生成温度 0.3：有文档依据的场景下抑制自由发挥；分类/重写侧用 0.0 追求确定性
+LLM_TEMPERATURE = 0.3
+# Query Rewrite 的 token 预算：deepseek-flash 是推理模型，思考也消耗预算，
+# 必须给足以免正文被思考耗尽（max_tokens=8 静默截断的教训）
+REWRITE_MAX_TOKENS = 512
+# 重写句长度合法域：短于 2 视为空输出，长于 120 视为失控（模型开始解释而非重写）
+REWRITE_MIN_CHARS = 2
+REWRITE_MAX_CHARS = 120
+# 重写 prompt 里每条历史的截断长度：防长回答把 prompt 撑爆
+REWRITE_HISTORY_SNIPPET = 150
+
 # refuse / clarify 固定话术（保持教练口吻，避免机器腔）
 REFUSE_REPLY = (
     "这个问题涉及伤病诊断和医疗建议，超出了我能安全回答的范围，我不能给你下结论。"
@@ -211,8 +227,8 @@ def add_document(md_path: Path, category: str = UPLOAD_CATEGORY) -> dict:
 def list_sources() -> list[str]:
     """返回库中所有不重复的文档来源名（source），按字典序排序。"""
     collection = _get_collection()
-    got = collection.get(include=["metadatas"])
-    return sorted({m.get("source", "") for m in got["metadatas"]} - {""})
+    stored = collection.get(include=["metadatas"])
+    return sorted({m.get("source", "") for m in stored["metadatas"]} - {""})
 
 
 def _search_categories(category: str) -> list[str] | None:
@@ -228,7 +244,9 @@ def _search_categories(category: str) -> list[str] | None:
 
 # ---- 混合检索（Hybrid Search：向量 + BM25 + RRF）----
 HYBRID_FETCH = 10  # 两路通道各取的候选数
-RRF_K = 60         # Reciprocal Rank Fusion 的平滑常数：score = Σ 1/(k + rank)
+# RRF 平滑常数：score = Σ 1/(k + rank)；60 为融合检索业界惯例值（原论文推荐），
+# 越大则两路名次差异对融合分的影响越平缓
+RRF_K = 60
 
 # 内存 BM25 索引缓存：{"index", "chunks", "id2chunk"}；None 表示未构建或不可用
 _BM25_STATE: dict | None = None
@@ -255,10 +273,10 @@ def _get_bm25() -> dict:
     import rank_bm25
 
     collection = _get_collection()
-    got = collection.get(include=["documents", "metadatas"])
+    stored = collection.get(include=["documents", "metadatas"])
     corpus = []
     chunks = []
-    for cid, text, meta in zip(got["ids"], got["documents"], got["metadatas"]):
+    for cid, text, meta in zip(stored["ids"], stored["documents"], stored["metadatas"]):
         doc_name = Path(meta.get("source", "")).stem
         corpus.append(list(jieba.cut_for_search(text + " " + doc_name)))
         chunks.append(
@@ -390,23 +408,22 @@ def rewrite_query(query: str, history: list[dict] | None) -> str:
     lines = ["你是一个查询重写助手。请结合历史对话，把用户的当前问题重写为一个不依赖上下文、独立完整的检索句子。只输出重写后的句子，不要任何解释。"]
     lines.append("例如：历史“深蹲怎么做”，当前“对膝盖好吗”，重写为“深蹲对膝盖好吗”。")
     lines.append("历史对话：")
-    for h in history[-4:]:
+    for h in history[-HISTORY_TURNS:]:
         role = "用户" if h.get("role") == "user" else "助手"
-        lines.append(f"{role}：{(h.get('content') or '')[:150]}")
+        lines.append(f"{role}：{(h.get('content') or '')[:REWRITE_HISTORY_SNIPPET]}")
     lines.append(f"当前问题：{query}")
     try:
-        client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL, timeout=60)
+        client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL, timeout=LLM_TIMEOUT_SECONDS)
         resp = client.chat.completions.create(
             model=DEEPSEEK_MODEL,
             messages=[{"role": "user", "content": "\n".join(lines)}],
             temperature=0.0,
-            # deepseek-flash 是推理模型：思考也要消耗预算，给足（max_tokens=8 的教训）
-            max_tokens=512,
+            max_tokens=REWRITE_MAX_TOKENS,
         )
         out = (resp.choices[0].message.content or "").strip()
         # 输出消毒：去包裹引号/换行；长度异常视为失败，降级原问题
         out = out.strip("“”‘’\"'「」").replace("\n", " ").strip()
-        if out and 2 <= len(out) <= 120:
+        if out and REWRITE_MIN_CHARS <= len(out) <= REWRITE_MAX_CHARS:
             return out
     except Exception as e:
         logger.warning("发生降级：Query Rewrite 调用失败，使用原始问题检索: %s", e)
@@ -491,7 +508,7 @@ def answer(query: str, history: list[dict] | None = None) -> dict:
 
     history：可选，最近几轮的对话（[{role, content}, ...]），用于多轮上下文。
     """
-    recent = history[-4:] if history else None
+    recent = history[-HISTORY_TURNS:] if history else None
     plan = _plan(query, recent)
 
     if plan["refused"] or plan["clarify"]:
@@ -504,11 +521,11 @@ def answer(query: str, history: list[dict] | None = None) -> dict:
         }
 
     messages = _build_messages(query, plan["hits"], history=recent)
-    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL, timeout=60)
+    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL, timeout=LLM_TIMEOUT_SECONDS)
     resp = client.chat.completions.create(
         model=DEEPSEEK_MODEL,
         messages=messages,
-        temperature=0.3,
+        temperature=LLM_TEMPERATURE,
     )
     answer_text = resp.choices[0].message.content or ""
     return {
@@ -537,7 +554,7 @@ def answer_stream(
 
     refuse / clarify / 相似度不足时不调大模型：meta + 完整话术单块输出，前端表现一致。
     """
-    recent = history[-4:] if history else None
+    recent = history[-HISTORY_TURNS:] if history else None
     plan = _plan(query, recent)
     meta = {
         "category": plan["category"],
@@ -555,11 +572,11 @@ def answer_stream(
     # 2) 流式生成
     yield _sse({"meta": meta})
     messages = _build_messages(query, plan["hits"], history=recent)
-    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL, timeout=60)
+    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL, timeout=LLM_TIMEOUT_SECONDS)
     resp = client.chat.completions.create(
         model=DEEPSEEK_MODEL,
         messages=messages,
-        temperature=0.3,
+        temperature=LLM_TEMPERATURE,
         stream=True,
     )
     for chunk in resp:
