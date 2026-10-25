@@ -31,16 +31,25 @@
     return pad(d.getHours()) + ":" + pad(d.getMinutes());
   }
 
-  // 平滑滚动：新消息出现时无条件到底；流式推进时仅在用户位于底部附近才跟随，
-  // 避免用户上翻查看历史时被不断拽回底部
+  // 智能滚动跟随（防拽回）：流式期间用户上滑离开底部（>150px）即暂停自动跟随，
+  // 滑回底部附近自动恢复；新消息出现（scrollToBottom）视为回到跟随态
+  let autoFollow = true;
+  let lastChatTop = 0;
+  chat.addEventListener("scroll", () => {
+    const goingUp = chat.scrollTop < lastChatTop - 4; // 4px 容差，忽略亚像素抖动
+    lastChatTop = chat.scrollTop;
+    if (goingUp && !isNearBottom()) autoFollow = false;
+    else if (isNearBottom()) autoFollow = true;
+  });
   function isNearBottom() {
-    return chat.scrollHeight - chat.scrollTop - chat.clientHeight < 120;
+    return chat.scrollHeight - chat.scrollTop - chat.clientHeight < 150;
   }
   function scrollToBottom() {
+    autoFollow = true; // 主动滚动（新消息）无条件回到跟随态
     chat.scrollTo({ top: chat.scrollHeight, behavior: "smooth" });
   }
   function followScroll() {
-    if (isNearBottom()) scrollToBottom();
+    if (autoFollow) chat.scrollTo({ top: chat.scrollHeight, behavior: "smooth" });
   }
 
   // 从非 200 响应体解析 FastAPI 标准报错 {"detail": "..."}（400 拦截 / 429 限流等），
@@ -57,21 +66,44 @@
 
   // ---------- 轻量富文本渲染（防注入） ----------
   // 先转义全部 HTML，再把受控标记转成白名单标签，最后清理任何残留的非白名单标签
+  // 支持无序列表（- / * 开头连续行）与有序列表（1. 数字开头连续行）
   function renderAnswer(text) {
     const src = String(text || "");
-    // 1) 先转义危险字符
+    // 1) 先转义危险字符（XSS 防线必须在任何标记替换之前，含列表语法）
     const escaped = src
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
       .replace(/"/g, "&quot;");
-    // 2) ``**文本**`` → <strong>…</strong>
-    let out = escaped.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-    // 3) \n → <br>
-    out = out.replace(/\n/g, "<br>");
-    // 4) 清理白名单之外的残留标签（只允许 <strong> 与 <br>）
-    out = out.replace(/<\/?(?!strong|br|\/strong|\/br)[a-zA-Z][^>]*>/g, "");
-    return out;
+    // 2) 行内加粗 ``**文本**`` → <strong>…</strong>（列表项内同样生效）
+    const bold = (s) => s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    // 3) 逐行处理：连续「- / * 」行合并为 <ul>，连续「数字. 」行合并为 <ol>，其余行保留换行
+    //    注意 ^\s*[-*]\s+ 不会误吞 **加粗** 行（第二个字符不是空白）
+    const lines = escaped.split("\n");
+    let html = "";
+    let list = null; // 当前列表标签（"ul" | "ol" | null）
+    for (const line of lines) {
+      const mUl = line.match(/^\s*[-*]\s+(.*)$/);
+      const mOl = mUl ? null : line.match(/^\s*\d+\.\s+(.*)$/);
+      if (mUl || mOl) {
+        const tag = mUl ? "ul" : "ol";
+        if (list !== tag) {
+          if (list) html += "</" + list + ">";
+          html += "<" + tag + ">";
+          list = tag;
+        }
+        html += "<li>" + bold(mUl ? mUl[1] : mOl[1]) + "</li>";
+      } else {
+        if (list) {
+          html += "</" + list + ">";
+          list = null;
+        }
+        html += bold(line) + "<br>";
+      }
+    }
+    if (list) html += "</" + list + ">";
+    // 4) 清理白名单之外的残留标签（允许 strong / br / ul / ol / li）
+    return html.replace(/<\/?(?!\/?(?:strong|br|ul|ol|li)\b)[a-zA-Z][^>]*>/g, "");
   }
 
   // ---------- 消息构建 ----------
@@ -150,6 +182,123 @@
       src.appendChild(tag);
     });
     bubble.appendChild(src);
+  }
+
+  // ---------- 气泡操作区：一键复制 + 重新生成 ----------
+  const COPY_SVG =
+    '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+  const COPIED_SVG =
+    '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="#16a34a" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>';
+  const REGEN_SVG =
+    '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>';
+
+  // 写入剪贴板：优先 clipboard API（带 1.5s 超时——部分内嵌 WebView 无剪贴板权限时
+  // promise 永不落定，不设上限会把复制按钮永久卡在禁用态）；
+  // 超时/被拒/非安全上下文（服务器 http://IP 部署）时回退临时 textarea + execCommand
+  async function copyToClipboard(text) {
+    if (navigator.clipboard && window.isSecureContext) {
+      let ok = false;
+      try {
+        ok = await Promise.race([
+          navigator.clipboard.writeText(text).then(
+            () => true,
+            () => false
+          ),
+          new Promise((r) => setTimeout(() => r(false), 1500)),
+        ]);
+      } catch (e) {
+        ok = false;
+      }
+      if (ok) return;
+    }
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.cssText = "position:fixed;opacity:0;pointer-events:none;";
+    document.body.appendChild(ta);
+    ta.select();
+    try {
+      if (!document.execCommand("copy")) throw new Error("execCommand copy failed");
+    } finally {
+      ta.remove();
+    }
+  }
+
+  // 给 AI 气泡挂底部操作区（复制按钮；「重新生成」由 refreshRegenButtons 单独挂最后一条）
+  function appendActions(bubble, rawText) {
+    const row = document.createElement("div");
+    row.className = "msg-actions";
+
+    const copyBtn = document.createElement("button");
+    copyBtn.type = "button";
+    copyBtn.className = "msg-act act-copy";
+    copyBtn.title = "复制回答";
+    copyBtn.setAttribute("aria-label", "复制回答");
+    copyBtn.innerHTML = COPY_SVG;
+    copyBtn.addEventListener("click", async () => {
+      if (copyBtn.disabled) return;
+      copyBtn.disabled = true;
+      try {
+        // 纯文本：去掉 Markdown 加粗符号；来源标签不在 rawText 内，天然干净
+        await copyToClipboard(String(rawText || "").replace(/\*\*/g, ""));
+        copyBtn.innerHTML = COPIED_SVG;
+        copyBtn.classList.add("is-copied");
+        showToast("已复制", true, 2000);
+        clearTimeout(copyBtn._t);
+        copyBtn._t = setTimeout(() => {
+          copyBtn.innerHTML = COPY_SVG;
+          copyBtn.classList.remove("is-copied");
+          copyBtn.disabled = false;
+        }, 2000);
+      } catch (e) {
+        copyBtn.disabled = false;
+        showToast("复制失败，请手动选择复制", false);
+      }
+    });
+    row.appendChild(copyBtn);
+    bubble.appendChild(row);
+  }
+
+  function makeRegenButton() {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "msg-act act-regen";
+    btn.title = "重新生成";
+    btn.setAttribute("aria-label", "重新生成");
+    btn.innerHTML = REGEN_SVG;
+    btn.addEventListener("click", regenerateAnswer);
+    return btn;
+  }
+
+  // 「重新生成」只挂在最后一条 AI 回答气泡上；消息每次变化后重挂
+  function refreshRegenButtons() {
+    chat.querySelectorAll(".act-regen").forEach((b) => b.remove());
+    if (busy) return; // 生成期间不提供
+    const wraps = chat.querySelectorAll(".msg.assistant");
+    for (let i = wraps.length - 1; i >= 0; i--) {
+      const bubble = wraps[i].querySelector(".bubble");
+      if (!bubble || bubble.classList.contains("bubble-welcome")) continue;
+      const row = bubble.querySelector(".msg-actions");
+      if (!row) continue;
+      row.appendChild(makeRegenButton());
+      return;
+    }
+  }
+
+  // 重新生成：取该回答对应的最近一次用户提问，作废其后所有回答，重发流式请求
+  function regenerateAnswer() {
+    if (busy) return;
+    let qi = -1;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === "user") {
+        qi = i;
+        break;
+      }
+    }
+    if (qi < 0) return;
+    const question = messages[qi].content;
+    messages.length = qi + 1; // 丢弃该提问之后的所有消息（通常是 1 条 AI 回答）
+    renderHistory(); // DOM 与 messages 严格对齐（顺带清掉旧气泡/错误气泡）
+    ask(question, { regen: true });
   }
 
   // ---------- 多会话历史管理（localStorage） ----------
@@ -260,11 +409,13 @@
         answerText.innerHTML = renderAnswer(m.content);
         bubble.appendChild(answerText);
         if (m.sources && m.sources.length) appendSources(bubble, m.sources);
+        appendActions(bubble, m.content);
       }
       body.appendChild(bubble);
       chat.appendChild(wrap);
     });
     if (!messages.length) addWelcome();
+    refreshRegenButtons();
   }
 
   function switchTo(id) {
@@ -340,18 +491,23 @@
   }
 
   // ---------- 流式问答 ----------
-  async function ask(text) {
+  async function ask(text, opts) {
+    const regen = !!(opts && opts.regen); // 重新生成：用户气泡已存在，不重复添加
     busy = true;
     currentController = new AbortController();
     input.disabled = true;
+    // 生成期间禁用所有「重新生成」按钮
+    chat.querySelectorAll(".act-regen").forEach((b) => (b.disabled = true));
     // 发送按钮切换为「停止」
     sendBtn.classList.add("is-stop");
     sendBtn.classList.remove("is-loading");
     btnLabel.textContent = "停止";
     sendBtn.setAttribute("aria-label", "停止生成");
 
-    addUser(text);
-    persistCurrent(); // 用户消息实时入 localStorage
+    if (!regen) {
+      addUser(text);
+      persistCurrent(); // 用户消息实时入 localStorage
+    }
     const typingWrap = addTyping();
     // 携带最近 3 轮历史（最多 6 条），排除刚加入的当前问题（它在 question 字段里）
     const history = messages
@@ -510,6 +666,7 @@
         note.textContent = "\u23F9 已停止生成";
         bubble.appendChild(note);
       }
+      appendActions(bubble, buf); // 底部操作区（复制；重新生成由下方统一挂载）
     } else if (!stopped && !errored) {
       // 流正常结束却连 meta 都没收到（如服务端中途断流）
       typingWrap.remove();
@@ -532,6 +689,7 @@
     persistCurrent(); // 完成后同步 localStorage
 
     busy = false;
+    refreshRegenButtons(); // 空闲后把「重新生成」挂回最后一条 AI 回答
     currentController = null;
     input.disabled = false;
     sendBtn.classList.remove("is-stop");

@@ -462,6 +462,42 @@ body {
   color: #b91c1c;
 }
 
+/* ===== 气泡操作区：复制 / 重新生成 ===== */
+.msg-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
+}
+.msg-act {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease; /* 只改颜色，不改几何 */
+}
+.msg-act:hover:not(:disabled) { background: var(--primary-weak); color: var(--primary); }
+.msg-act.is-copied { color: #16a34a; }
+.msg-act:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* ===== Markdown 列表渲染（回答气泡内） ===== */
+.answer-text ul,
+.answer-text ol {
+  display: block;
+  margin: 6px 0;
+  padding-left: 22px;
+}
+.answer-text li { margin: 3px 0; }
+.answer-text li::marker { color: var(--primary); font-weight: 600; }
+
 /* ===== 历史对话（多会话管理） ===== */
 .new-chat-btn {
   width: 100%;
